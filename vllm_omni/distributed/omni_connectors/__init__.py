@@ -7,6 +7,11 @@ from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
 
 try:
+    from .connectors.myelon_shm_connector import MyelonShmConnector
+except ImportError:
+    MyelonShmConnector = None  # `myelon_objstore` PyO3 binding not built/installed
+
+try:
     from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
 except ImportError:
     MooncakeTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mooncake) not installed
@@ -37,6 +42,7 @@ __all__ = [
     "MooncakeConnector",  # compat alias → MooncakeStoreConnector
     "MooncakeStoreConnector",
     "MooncakeTransferEngineConnector",
+    "MyelonShmConnector",
     "SharedMemoryConnector",
     "YuanrongConnector",
     # Utilities

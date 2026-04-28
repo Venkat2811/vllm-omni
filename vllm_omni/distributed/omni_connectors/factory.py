@@ -102,10 +102,22 @@ def _create_mooncake_transfer_engine_connector(config: dict[str, Any]) -> OmniCo
     return MooncakeTransferEngineConnector(config)
 
 
+def _create_myelon_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .connectors.myelon_shm_connector import MyelonShmConnector
+    except ImportError:
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from omni_connectors.connectors.myelon_shm_connector import MyelonShmConnector
+    return MyelonShmConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeStoreConnector", _create_mooncake_store_connector)
 OmniConnectorFactory.register_connector("MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
+OmniConnectorFactory.register_connector("MyelonShmConnector", _create_myelon_shm_connector)
 # Backward-compatible aliases – will be removed in the future
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_store_connector)
