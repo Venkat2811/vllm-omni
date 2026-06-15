@@ -36,7 +36,14 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 4
-    gpu_memory_utilization: 0.3
+    # Real serving split on a 12 GB RTX 3060: Stage 0 (backbone ~1B in bf16 +
+    # KV) takes the larger share, Stage 1 (Mimi vocoder) the smaller. Both
+    # fractions are of TOTAL device memory and the stages co-reside on device 0,
+    # so 0.55 + 0.35 = 0.90 leaves headroom for the HF aux modules (fp32 depth
+    # decoder + frame/text embeds loaded in Stage 0) and the Mimi codec weights.
+    # The committed 0.3/0.3 was a de-risking placeholder that under-provisions
+    # the backbone KV cache for real utterances.
+    gpu_memory_utilization: 0.55
     enforce_eager: true
     enable_prefix_caching: false
     max_num_batched_tokens: 2048
@@ -52,7 +59,7 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 1
-    gpu_memory_utilization: 0.3
+    gpu_memory_utilization: 0.35
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
