@@ -327,6 +327,13 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             if list(dd_unexpected):
                 logger.warning("CSM depth_decoder unexpected keys: %s", list(dd_unexpected)[:8])
             loaded |= {n for n, _ in self._depth_decoder.named_parameters(prefix="_depth_decoder")}
+            # The same HF depth module is also wired into the ``depth`` wrapper
+            # (``self.depth.set_module(self._depth_decoder)``), which auto-
+            # registers it under ``depth._module.*`` (nn.Module submodule
+            # registration). Credit that aliased name span too, else vLLM's
+            # load-completeness validator (default_loader.track_weights_loading)
+            # flags ``depth._module.*`` as uninitialized at boot (B2).
+            loaded |= {n for n, _ in self.depth.named_parameters(prefix="depth")}
 
         self._maybe_tie_depth_embed()
         return loaded
@@ -650,6 +657,28 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                 codes_out[i] = torch.zeros((0, self.num_codebooks), dtype=torch.long, device=device)
             else:
                 codes_out[i] = frame_codes.to(torch.long)  # (1, 32)
+
+            # Default-off validation hook: dump per-request served frames to a
+            # JSONL so an offline driver can assert frame-for-frame vs HF greedy
+            # (GATE-B). Zero effect unless ``VLLM_CSM_DUMP_FRAMES`` is set.
+            _dump = __import__("os").environ.get("VLLM_CSM_DUMP_FRAMES")
+            if _dump:
+                try:
+                    import json as _json
+
+                    with open(_dump, "a") as _fh:
+                        _fh.write(
+                            _json.dumps(
+                                {
+                                    "req": req_key,
+                                    "eos": bool(is_eos),
+                                    "frame": frame_codes[0].detach().cpu().tolist(),
+                                }
+                            )
+                            + "\n"
+                        )
+                except Exception:
+                    pass
 
         # text_hidden_states feeds compute_logits' sample-row gather; pass through.
         return OmniOutput(
