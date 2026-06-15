@@ -71,6 +71,9 @@ _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
 _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
+# CSM-1B (Sesame) 2-stage: Stage 0 (backbone AR + inline depth) is the TTS stage
+# the serving layer dispatches on; model_stage == "csm" (see csm/pipeline.py).
+_CSM_TTS_MODEL_STAGES = {"csm"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -83,6 +86,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
+    | _CSM_TTS_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
@@ -91,6 +95,11 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "cosyvoice3",
     "voxcpm2",
     "higgs_audio_v2",
+    # CSM's Stage-0 AR length (one cb0 token == one 80 ms frame) is bounded by
+    # SamplingParams.max_tokens; map request.max_new_tokens onto it so the
+    # scheduler stops at the cap. The model also enforces a fail-closed
+    # per-request frame cap (csm_backbone _DEFAULT_MAX_FRAMES / max_new_frames).
+    "csm",
 }
 _TTS_LANGUAGES: set[str] = {
     "Auto",
@@ -408,6 +417,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
+        self._csm_tokenizer = None
 
         logger.info("Loaded %d supported speakers: %s", len(self.supported_speakers), sorted(self.supported_speakers))
 
@@ -568,6 +578,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "higgs_audio_v2"
         if model_stage in _GLM_TTS_MODEL_STAGES:
             return "glm_tts"
+        if model_stage in _CSM_TTS_MODEL_STAGES:
+            return "csm"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -1217,6 +1229,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_moss_tts_request(request)
         if self._tts_model_type == "glm_tts":
             return self._validate_glm_tts_request(request)
+        if self._tts_model_type == "csm":
+            return self._validate_csm_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
@@ -1551,6 +1565,68 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
                 return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
         return None
+
+    def _validate_csm_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate a CSM-1B request.
+
+        CSM-1B is a plain text -> speech model with speaker-id conditioning
+        (the OpenAI ``voice`` field maps to a CSM speaker id, default "0").
+        Voice cloning (reference audio context turns) is out of scope for this
+        wedge, so ``ref_audio`` / ``ref_text`` are not accepted.
+        """
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        if request.voice is not None and not str(request.voice).strip().isdigit():
+            return "CSM 'voice' must be a non-negative integer speaker id (e.g. '0')"
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+        return None
+
+    def _get_csm_tokenizer(self):
+        """Lazily load + cache the CSM Llama text tokenizer.
+
+        CSM-1B ships a standard Llama tokenizer (``tokenizer.json``) plus the
+        ``<|begin_of_text|>`` / ``<|end_of_text|>`` special tokens. We tokenize
+        the speaker-tagged text ourselves so the prompt carries the exact
+        ``prompt_token_ids`` the Stage-0 backbone embeds in ``_embed_text_prompt``.
+        """
+        if self._csm_tokenizer is None:
+            from transformers import AutoTokenizer
+
+            model_name = self.engine_client.model_config.model
+            self._csm_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        return self._csm_tokenizer
+
+    def _build_csm_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build the Stage-0 backbone prompt for a CSM text -> speech request.
+
+        CSM's text-conditioning format is ``<|begin_of_text|>[<spk>]<text><|end_of_text|>``.
+        We tokenize that here and return an ``OmniTokensPrompt`` whose
+        ``prompt_token_ids`` set the prefill length the scheduler sees AND whose
+        ``additional_information`` carries the same ids (the backbone reads
+        ``prompt_token_ids`` from ``additional_information`` in
+        ``_embed_text_prompt``), plus the resolved sampling + the ``max_new_frames``
+        hard cap (the model's fail-closed backstop, see csm_backbone).
+        """
+        tokenizer = self._get_csm_tokenizer()
+        speaker = str(request.voice).strip() if request.voice is not None else "0"
+        text = f"<|begin_of_text|>[{speaker}]{request.input}<|end_of_text|>"
+        prompt_token_ids = list(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+        additional_information: dict[str, Any] = {"prompt_token_ids": prompt_token_ids}
+        # Forward the hard frame cap so the model's per-request backstop matches
+        # the scheduler's SamplingParams.max_tokens stop. Only set when the caller
+        # asked for one (ruff F841: every forwarded field is consumed model-side).
+        if request.max_new_tokens is not None:
+            additional_information["max_new_frames"] = request.max_new_tokens
+
+        prompt = tokens_input(prompt_token_ids=prompt_token_ids)
+        prompt["additional_information"] = additional_information
+        prompt["cache_salt"] = _conditioning_cache_salt(request, additional_information)
+        return prompt
 
     async def _build_higgs_audio_v2_params(self, request: OpenAICreateSpeechRequest):
         """Build prompt_token_ids for higgs_audio_v2 via the upstream processor.
@@ -2451,6 +2527,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             elif self._tts_model_type == "ming_flash_omni_tts":
                 prompt = self._build_ming_prompt(request)
                 tts_params = {}
+            elif self._tts_model_type == "csm":
+                prompt = self._build_csm_prompt(request)
+                tts_params = {}
             elif self._tts_model_type == "moss_tts_nano":
                 tts_params = await self._build_moss_tts_params(request)
                 if request.voice:
@@ -2525,6 +2604,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "higgs_audio_v2"
         elif self._tts_model_type == "glm_tts":
             model_type = "glm_tts"
+        elif self._tts_model_type == "csm":
+            model_type = "csm"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:

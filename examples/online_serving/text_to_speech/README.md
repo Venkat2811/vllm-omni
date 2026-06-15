@@ -14,6 +14,7 @@ For the full list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
+| CSM-1B | `sesame/csm-1b` | — | ✓ (PCM stream) | speaker id via `voice` (e.g. `"0"`) | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
@@ -92,6 +93,46 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 24 kHz for the others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## CSM-1B
+
+Sesame's CSM-1B, a 2-stage TTS model at 24 kHz: Stage 0 is a Llama-style
+backbone AR that samples codebook-0 per 80 ms frame and runs a 31-step depth
+decoder inline to produce the full 32-code frame; Stage 1 is the Mimi vocoder
+(code2wav). Plain text -> speech with speaker-id conditioning; the OpenAI
+`voice` field maps to a CSM speaker id (a non-negative integer string, default
+`"0"`). No named voice presets and no reference-audio voice cloning on this path.
+
+### Launch
+```bash
+vllm-omni serve sesame/csm-1b --deploy-config vllm_omni/deploy/csm.yaml --omni --trust-remote-code --port 8091
+# or:
+bash examples/online_serving/text_to_speech/csm/run_server.sh
+```
+
+### Sending requests
+```bash
+# Non-streaming WAV
+python examples/online_serving/text_to_speech/csm/speech_client.py \
+    --text "Hello from CSM." --voice 0 --output out.wav
+
+# Streaming PCM (24 kHz mono s16le); prints time-to-first-audio-byte
+python examples/online_serving/text_to_speech/csm/speech_client.py \
+    --text "Hello from CSM." --stream --output out.pcm
+
+# Cap generation length (frames; 1 frame == 80 ms)
+python examples/online_serving/text_to_speech/csm/speech_client.py \
+    --text "A longer line." --max-new-tokens 64
+```
+
+### Notes
+- Output: 24 kHz mono via the Mimi vocoder. Streamed PCM is raw s16le.
+- `voice` is a CSM speaker id string (e.g. `"0"`), not a named preset.
+- `max_new_tokens` caps the Stage-0 AR loop in frames (1 frame == 80 ms). The
+  model also enforces a fail-closed per-request frame cap so a request can never
+  run past the cap even under the non-terminating greedy/repetition attractor.
 
 ---
 
