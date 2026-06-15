@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CSM-1B single-stage model for vLLM-Omni (SCAFFOLD — C1).
+"""CSM-1B single-stage dual-AR speech model for vLLM-Omni.
 
 CSM-1B (``sesame/csm-1b``) is a dual-autoregressive speech model:
 
@@ -10,13 +10,19 @@ CSM-1B (``sesame/csm-1b``) is a dual-autoregressive speech model:
       -> a 32-code frame
       -> Mimi codec decode -> 1920 samples (80 ms @ 24 kHz)
 
-This file is the **C1 scaffold**: it rebuilds the backbone on vLLM-native
-``LlamaDecoderLayer`` + ``PagedAttention`` + fused ``QKVParallelLinear`` /
-``ParallelLMHead`` (NOT an HF wrapper) using a synthetic ``LlamaConfig``
-synthesised from ``CsmConfig`` (see ``configuration_csm``). The streaming
-``inference_stream()`` generator is present in skeleton form; the 31-step
-depth loop (C2) and the Mimi codec decode (C3) are explicit
-``NotImplementedError`` stubs.
+The backbone is rebuilt on vLLM-native ``LlamaDecoderLayer`` + ``PagedAttention``
++ fused ``QKVParallelLinear`` (C1) using a synthetic ``LlamaConfig`` synthesised
+from ``CsmConfig`` (see ``configuration_csm``). The 31-step depth decoder (C2)
+runs as **custom dense torch inside** this model's streaming loop — it is a
+second, small AR model nested inside each backbone decode step, with its own
+4-layer / d1024 / head_dim128 dense KV that is reset every frame (33 positions).
+The Mimi codec (C3) decodes each 32-code frame into 1920 PCM samples.
+
+Per-frame embedding composition (A2 §2.4): the next backbone position embeds the
+whole 32-code frame by summing the 32 per-codebook embeddings (with per-codebook
+offsets) into one ``(num_codebooks * vocab_size, hidden)`` table, then feeds the
+result to the backbone as ``inputs_embeds`` — vLLM's ``LlamaModel.forward``
+consumes ``inputs_embeds`` directly and bypasses its own (unused) token embed.
 
 Streaming follows the VoxCPM/MOSS-TTS-Nano pattern:
   - On first forward() for a request, inference_stream() is started as a
@@ -26,7 +32,9 @@ Streaming follows the VoxCPM/MOSS-TTS-Nano pattern:
   - compute_logits() emits EOS only when the last chunk has been yielded.
 
 Weight loading deliberately happens inside load_weights() -- NOT __init__ --
-so vLLM initialises distributed state before any CUDA allocations occur.
+so vLLM initialises distributed state before any CUDA allocations occur. The
+CSM checkpoint is split by ``backbone_model.*`` / ``lm_head.*`` /
+``depth_decoder.*`` / ``codec_model.*`` prefixes (see load_weights()).
 """
 
 from __future__ import annotations
@@ -63,6 +71,11 @@ _DEFAULT_MAX_NEW_FRAMES = 1024  # bounded; one frame = 80 ms
 _NUM_CODEBOOKS = 32
 _DEPTH_INNER_STEPS = 31  # cb1..cb31 after the backbone produces cb0
 _MIMI_SAMPLES_PER_FRAME = 1920
+_CODEBOOK_EOS_ID = 0  # codebook_eos_token_id; a frame with cb0..cb30==0 is EOS.
+
+# Reserved per-codebook ids (Mimi vocab 2051): 2048/2049/2050 must NEVER reach
+# the Mimi codec (its real codebook size is 2048). Clamp before decode.
+_MIMI_CODEBOOK_SIZE = 2048
 
 
 def _pick(info: dict, key: str, default):
@@ -71,6 +84,26 @@ def _pick(info: dict, key: str, default):
     if isinstance(val, (list, tuple)) and len(val) > 0:
         return val[0]
     return val if val is not None else default
+
+
+def _sample_logits(logits: torch.Tensor, temperature: float, top_k: int) -> torch.Tensor:
+    """Sample one token id per row from logits.
+
+    PHASE3 §1 numerics hygiene: ``logits`` are cast to fp32 *before* this call
+    (no bf16 op flows into the sampler). temperature<=0 is greedy (argmax).
+    Returns a ``(B,)`` LongTensor. Keeps the op shapes fixed (top-k via a
+    masked fill) so a future CUDA-graph capture sees a stable reduction order.
+    """
+    logits = logits.float()
+    if temperature is None or temperature <= 0.0:
+        return torch.argmax(logits, dim=-1)
+
+    logits = logits / temperature
+    if top_k and top_k > 0 and top_k < logits.shape[-1]:
+        kth = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
+        logits = torch.where(logits < kth, torch.full_like(logits, float("-inf")), logits)
+    probs = torch.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
 class CsmBackbone(nn.Module):
@@ -83,9 +116,15 @@ class CsmBackbone(nn.Module):
     intact (R0 §4), which is what makes a future right-pad cohort (R0 §2) clean
     at bf16 B>1.
 
-    The codebook-0 (cb0) logits head is a fused ``ParallelLMHead`` over the
-    per-codebook audio vocab; the remaining 31 codebooks are produced by the
-    depth decoder (C2), which is constructed lazily in ``CsmForGeneration``.
+    The codebook-0 (cb0) logits head is ``cb0_head`` over the per-codebook audio
+    vocab; in the ``sesame/csm-1b`` checkpoint this is the (untied) ``lm_head``.
+
+    NOTE on embeddings: the CSM backbone's input embedding is NOT a plain token
+    table — it is the Σ-over-32-codebooks frame embed (A2 §2.4), owned by the
+    parent ``CsmForGeneration`` as ``frame_embed``. The vLLM ``LlamaModel`` keeps
+    its own ``embed_tokens`` (a ``VocabParallelEmbedding`` over the cb0 vocab) but
+    it is unused at inference: we always drive the backbone with ``inputs_embeds``
+    composed from the frame embed, so no checkpoint weight is routed to it.
     """
 
     # vLLM Llama weight packing: fused qkv_proj <- {q,k,v}_proj and
@@ -104,9 +143,9 @@ class CsmBackbone(nn.Module):
         # Synthetic LlamaConfig describing ONLY the backbone (A2 §2.1).
         backbone_llama_config = build_backbone_llama_config(csm_config)
 
-        # Swap the synthetic LlamaConfig into a shallow copy of vllm_config so
-        # vLLM's native LlamaModel sees a standard Llama config (not the nested
-        # CsmConfig). We keep the original CsmConfig on the parent module.
+        # Swap the synthetic LlamaConfig into vllm_config so vLLM's native
+        # LlamaModel sees a standard Llama config (not the nested CsmConfig).
+        # We keep the original CsmConfig on the parent module.
         backbone_vllm_config = vllm_config
         backbone_model_config = vllm_config.model_config
         backbone_model_config.hf_config = backbone_llama_config
@@ -117,8 +156,9 @@ class CsmBackbone(nn.Module):
             prefix=maybe_prefix(prefix, "model"),
         )
 
-        # cb0 logits surface: one codebook of audio tokens. Tied to the input
-        # embedding when ``tie_word_embeddings`` (A2 §2.1) to drop a dead head.
+        # cb0 logits surface: one codebook of audio tokens. In the checkpoint
+        # this is the untied ``lm_head`` (config sets tie_word_embeddings=False;
+        # tie_codebooks_embeddings ties the *audio embeddings*, handled in C3).
         self.cb0_head = ParallelLMHead(
             csm_config.vocab_size,
             csm_config.hidden_size,
@@ -133,12 +173,11 @@ class CsmBackbone(nn.Module):
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the backbone for one new KV position; return hidden states.
+        """Run the backbone for one or more KV positions; return hidden states.
 
-        NOTE (C1 scaffold): the backbone is wired but the per-frame embedding
-        composition (Σ over the 32 codebooks -> one (65632, 2048) frame-embed
-        table, tied to the depth embed; A2 §2.4) is a C3 item. For C1 this
-        runs the bare vLLM Llama forward.
+        The per-frame embedding composition (Σ over the 32 codebooks via the
+        parent's ``frame_embed`` table; A2 §2.4) is performed by the caller and
+        passed through ``inputs_embeds``; this just forwards to the vLLM Llama.
         """
         return self.model(
             input_ids=input_ids,
@@ -148,22 +187,27 @@ class CsmBackbone(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Delegate to vLLM's LlamaModel weight loader (stacked-params packing).
+        """Delegate the backbone decoder layers + norm to vLLM's LlamaModel.
 
         ``LlamaModel.load_weights`` applies ``packed_modules_mapping`` to fuse
-        q/k/v -> qkv_proj and gate/up -> gate_up_proj. The C4 glue will route
-        the ``backbone.*`` prefix of the CSM checkpoint here and the
-        ``depth_decoder.*`` / ``codec.*`` prefixes to C2 / C3.
+        q/k/v -> qkv_proj and gate/up -> gate_up_proj. Only the decoder-layer
+        and final-norm weights of the CSM ``backbone_model.*`` prefix are routed
+        here; the audio embed table and the cb0/lm_head are handled by the
+        parent (see ``CsmForGeneration.load_weights``).
         """
         return self.model.load_weights(weights)
 
 
 class CsmForGeneration(nn.Module):
-    """Single-stage CSM-1B model with streaming audio output (C1 scaffold).
+    """Single-stage CSM-1B model with streaming audio output.
 
     Uses the VoxCPM/MOSS pattern: inference_stream() is stored per-request and
     yields one audio chunk per forward() call; the AR scheduler keeps the
     request alive until compute_logits() emits EOS.
+
+    Dual-AR per-frame body (A2 §2):
+      backbone forward -> cb0 -> 31-step depth loop (cb1..cb31) -> 32-code frame
+      -> Mimi decode -> 1920 samples.
     """
 
     requires_raw_input_tokens = True
@@ -181,16 +225,34 @@ class CsmForGeneration(nn.Module):
         self.config: CsmConfig = vllm_config.model_config.hf_config
         self.model_path: str = vllm_config.model_config.model
 
+        self.num_codebooks = int(getattr(self.config, "num_codebooks", _NUM_CODEBOOKS))
+        self.codebook_vocab_size = int(
+            getattr(self.config, "codebook_vocab_size", 2051)
+        )
+        self.hidden_size = int(getattr(self.config, "hidden_size", 2048))
+
         # Backbone is constructed now (vLLM-native layers, no CUDA alloc until
-        # load_weights). The depth decoder (C2) and Mimi codec (C3) are
-        # constructed lazily in load_weights() to stay off the init path.
+        # load_weights). Constructing CsmBackbone mutates vllm_config's
+        # model_config.hf_config into the synthetic LlamaConfig, so we cache the
+        # CsmConfig above first.
         self.backbone = CsmBackbone(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "backbone"),
         )
-        self._depth_decoder: nn.Module | None = None  # C2
-        self._mimi_codec: nn.Module | None = None  # C3
+
+        # The depth decoder (C2) and Mimi codec (C3) are HF reference modules
+        # constructed from the nested CSM config. They are built lazily in
+        # load_weights() (after distributed init) to stay off the __init__ path.
+        self._depth_decoder: nn.Module | None = None  # CsmDepthDecoderForCausalLM
+        self._mimi_codec: nn.Module | None = None  # MimiModel
+        # Frame-embed table (A2 §2.4): Σ over the 32 codebooks. Built in
+        # load_weights() from the backbone_model.embed_tokens.* checkpoint
+        # weight; tied to the depth embed (tie_codebooks_embeddings).
+        self._frame_embed: nn.Module | None = None  # CsmBackboneModelEmbeddings
+        self._text_embed: nn.Module | None = None  # nn.Embedding (text prompt)
+        self._hf_config: Any = None  # authoritative HF CsmConfig (load_weights)
         self._device: torch.device | None = None
+        self._dtype: torch.dtype = torch.float32
         self._lock = threading.Lock()
 
         # Per-request streaming generators (VoxCPM pattern).
@@ -203,31 +265,170 @@ class CsmForGeneration(nn.Module):
     # ------------------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load backbone weights via the vLLM-native loader.
+        """Split the CSM checkpoint by prefix and route each part.
 
-        C1 routes the backbone weights through ``CsmBackbone.load_weights``
-        (stacked-params packing). The depth decoder (C2) and Mimi codec (C3)
-        weight routing — splitting the CSM checkpoint by ``backbone.*`` /
-        ``depth_decoder.*`` / ``codec.*`` prefixes — is filled in there.
+        The ``sesame/csm-1b`` checkpoint top-level prefixes are:
+          - ``backbone_model.layers.* / backbone_model.norm.*`` -> vLLM Llama
+            (via ``CsmBackbone.load_weights``; the ``backbone_model.`` prefix is
+            stripped to the ``model.`` names vLLM expects).
+          - ``backbone_model.embed_tokens.embed_audio_tokens.weight`` -> the
+            frame-embed table (A2 §2.4), held by ``self._frame_embed``.
+          - ``lm_head.weight`` -> the cb0 head (``backbone.cb0_head``).
+          - ``embed_text_tokens.weight`` -> text-prefill embed (kept on the
+            frame-embed module; only used for the text prompt prefill).
+          - ``depth_decoder.*`` -> the HF ``CsmDepthDecoderForCausalLM`` (C2).
+          - ``codec_model.*`` -> the HF Mimi codec (C3).
         """
         with self._lock:
+            if self._depth_decoder is not None:
+                return set()
             try:
                 self._device = next(self.parameters()).device
             except StopIteration:
-                self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                self._device = torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu"
+                )
+            self._dtype = self.config.torch_dtype or torch.float32
 
-        # C1: only the backbone is wired. Route backbone-prefixed weights to
-        # the vLLM-native loader; ignore depth/codec until C2/C3.
-        backbone_weights = (
-            (name[len("backbone.") :] if name.startswith("backbone.") else name, w)
-            for name, w in weights
-        )
-        loaded = self.backbone.load_weights(backbone_weights)
+            self._build_aux_modules()
 
-        # TODO(C2): construct + load the depth decoder (4 layers / d1024 /
-        #           head_dim 128, dense static KV, 33 positions reset/frame).
-        # TODO(C3): construct + load the Mimi codec decoder.
+        backbone_layer_weights: list[tuple[str, torch.Tensor]] = []
+        depth_weights: list[tuple[str, torch.Tensor]] = []
+        codec_weights: list[tuple[str, torch.Tensor]] = []
+        loaded: set[str] = set()
+
+        frame_embed_state: dict[str, torch.Tensor] = {}
+        text_embed_state: dict[str, torch.Tensor] = {}
+        cb0_head_state: dict[str, torch.Tensor] = {}
+
+        for name, w in weights:
+            if name.startswith("backbone_model.embed_tokens."):
+                # backbone_model.embed_tokens.embed_audio_tokens.weight ->
+                # the frame-embed table (strip the embed_tokens. prefix so the
+                # remaining key matches CsmBackboneModelEmbeddings' param name).
+                sub = name[len("backbone_model.embed_tokens.") :]
+                frame_embed_state[sub] = w
+                loaded.add(name)
+            elif name.startswith("backbone_model."):
+                # decoder layers + final norm -> vLLM LlamaModel (strip prefix)
+                backbone_layer_weights.append((name[len("backbone_model.") :], w))
+            elif name == "lm_head.weight":
+                cb0_head_state["weight"] = w
+                loaded.add(name)
+            elif name == "embed_text_tokens.weight":
+                text_embed_state["weight"] = w  # text-prompt prefill embed
+                loaded.add(name)
+            elif name.startswith("depth_decoder."):
+                depth_weights.append((name[len("depth_decoder.") :], w))
+            elif name.startswith("codec_model."):
+                codec_weights.append((name[len("codec_model.") :], w))
+            else:
+                logger.warning("CSM load_weights: unrouted weight %s", name)
+
+        # Backbone decoder layers + norm through vLLM's stacked-param loader.
+        loaded |= {
+            f"backbone_model.{n}"
+            for n in self.backbone.load_weights(iter(backbone_layer_weights))
+        }
+
+        # cb0 head <- lm_head.weight.
+        if "weight" in cb0_head_state:
+            self._load_into(self.backbone.cb0_head, {"weight": cb0_head_state["weight"]})
+
+        # Frame-embed table + text-prompt embed via direct state load.
+        if self._frame_embed is not None and frame_embed_state:
+            self._frame_embed.load_state_dict(frame_embed_state, strict=False)
+        if self._text_embed is not None and text_embed_state:
+            self._text_embed.load_state_dict(text_embed_state, strict=False)
+
+        # Depth decoder + Mimi codec via HF-style state-dict load.
+        if self._depth_decoder is not None:
+            missing, unexpected = self._depth_decoder.load_state_dict(
+                dict(depth_weights), strict=False
+            )
+            if unexpected:
+                logger.warning("CSM depth_decoder unexpected keys: %s", unexpected[:8])
+            loaded |= {f"depth_decoder.{n}" for n, _ in depth_weights}
+        if self._mimi_codec is not None:
+            self._mimi_codec.load_state_dict(dict(codec_weights), strict=False)
+            loaded |= {f"codec_model.{n}" for n, _ in codec_weights}
+
+        # tie_codebooks_embeddings: depth embed table == backbone audio embed.
+        self._maybe_tie_depth_embed()
         return loaded
+
+    def _build_aux_modules(self) -> None:
+        """Construct the depth decoder, Mimi codec, frame-embed + text embed.
+
+        These are HF reference modules (dense torch) — the depth decoder runs
+        the 31-step inner loop with its own DynamicCache (NOT PagedAttention),
+        which is exactly the A2 §2.2 contract ("custom dense torch inside the
+        Stage-0 model"). The Mimi codec is the C3 decoder.
+
+        They are built from the **authoritative HF CsmConfig** loaded from the
+        model path (NOT the vllm-omni hoisted CsmConfig), so the strict HF
+        attribute names (``codebook_size``, the typed ``CsmDepthDecoderConfig``,
+        the ``MimiConfig``) are exactly what the HF module ``__init__`` expects.
+        """
+        from transformers import AutoConfig, AutoModel
+        from transformers.models.csm.modeling_csm import (
+            CsmBackboneModelEmbeddings,
+            CsmDepthDecoderForCausalLM,
+        )
+
+        hf_cfg = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+        self._hf_config = hf_cfg
+        depth_cfg = hf_cfg.depth_decoder_config
+        codec_cfg = hf_cfg.codec_config
+
+        self._frame_embed = CsmBackboneModelEmbeddings(hf_cfg)
+        self._text_embed = nn.Embedding(
+            int(hf_cfg.text_vocab_size), int(hf_cfg.hidden_size)
+        )
+        self._depth_decoder = CsmDepthDecoderForCausalLM(depth_cfg)
+        self._mimi_codec = AutoModel.from_config(codec_cfg)
+
+        for m in (
+            self._frame_embed,
+            self._text_embed,
+            self._depth_decoder,
+            self._mimi_codec,
+        ):
+            m.to(device=self._device, dtype=self._dtype)
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad_(False)
+
+    def _maybe_tie_depth_embed(self) -> None:
+        """Tie the depth decoder's audio embed to the backbone audio embed.
+
+        ``tie_codebooks_embeddings=True`` (config) ties
+        ``backbone_model.embed_tokens.embed_audio_tokens.weight`` and
+        ``depth_decoder.model.embed_tokens.weight`` (both (32*2051, 2048)). The
+        checkpoint stores only the backbone copy; mirror it onto the depth embed.
+        """
+        if self._frame_embed is None or self._depth_decoder is None:
+            return
+        if not getattr(self.config, "tie_codebooks_embeddings", True):
+            return
+        try:
+            src = self._frame_embed.embed_audio_tokens.weight
+            self._depth_decoder.model.embed_tokens.weight = src
+        except AttributeError:
+            logger.warning("CSM: could not tie depth embed to backbone audio embed")
+
+    @staticmethod
+    def _load_into(module: nn.Module, state: dict[str, torch.Tensor]) -> None:
+        params = dict(module.named_parameters())
+        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+        for name, w in state.items():
+            if name not in params:
+                logger.warning("CSM: %s not in %s", name, type(module).__name__)
+                continue
+            param = params[name]
+            loader = getattr(param, "weight_loader", default_weight_loader)
+            loader(param, w)
 
     # ------------------------------------------------------------------
     # Dummy run support
@@ -237,18 +438,11 @@ class CsmForGeneration(nn.Module):
         return [{"text": "hello", "_is_dummy": True}] * num_reqs
 
     # ------------------------------------------------------------------
-    # Streaming generator (VoxCPM pattern) — SKELETON
+    # Streaming generator (VoxCPM pattern)
     # ------------------------------------------------------------------
 
     def _create_stream_gen(self, info: dict[str, Any]):
-        """Create an inference_stream() generator for a request.
-
-        Yields (waveform_tensor, is_last) tuples. The per-frame body (the
-        dual-AR frame runner) is the heart of the port and is split into the
-        depth loop (C2) and the Mimi decode (C3); both are NotImplementedError
-        stubs below so the scaffold imports and registers but does not yet run
-        a forward.
-        """
+        """Create an inference_stream() generator for a request."""
         text: str = str(_pick(info, "text", "") or "")
         if not text.strip():
             logger.warning("CSM received empty text; yielding silence.")
@@ -260,111 +454,235 @@ class CsmForGeneration(nn.Module):
         temperature: float = float(_pick(info, "temperature", _DEFAULT_TEMPERATURE))
         top_k: int = int(_pick(info, "top_k", _DEFAULT_TOP_K))
 
-        # The dual-AR frame loop (A2 §2): each iteration is one 80 ms frame.
         yield from self.inference_stream(
+            info=info,
             text=text,
             max_new_frames=max_new_frames,
             temperature=temperature,
             top_k=top_k,
         )
 
+    # ------------------------------------------------------------------
+    # Prefill helpers
+    # ------------------------------------------------------------------
+
+    def _embed_text_prompt(self, info: dict[str, Any]) -> torch.Tensor:
+        """Embed the text prompt token ids into backbone hidden states.
+
+        The serving layer hands the tokenized prompt via the runtime info under
+        the ``prompt_token_ids`` key (CSM uses Llama text-token ids). Each text
+        token is embedded with ``embed_text_tokens`` (text_vocab_size, hidden).
+        Returns ``(1, T, hidden)``.
+        """
+        token_ids = _pick(info, "prompt_token_ids", None)
+        if token_ids is None:
+            token_ids = info.get("prompt_token_ids")
+        if token_ids is None:
+            # Fall back to a single BOS so prefill is non-empty; the GPU run
+            # will route real tokenized ids here (see GPU checklist item).
+            bos = int(getattr(self.config, "bos_token_id", 128000) or 128000)
+            token_ids = [bos]
+        ids = torch.as_tensor(token_ids, dtype=torch.long, device=self._device).view(-1)
+        return self._text_embed(ids).unsqueeze(0)
+
+    def _compose_frame_embed(self, frame_codes: torch.Tensor) -> torch.Tensor:
+        """Σ over the 32 codebooks -> one backbone input embedding (A2 §2.4).
+
+        ``frame_codes`` is ``(B, 32)`` Long. ``CsmBackboneModelEmbeddings``
+        expects ``(B, T, num_codebooks)`` and sums over the codebook dim, so we
+        add a length-1 frame axis. Returns ``(B, 1, hidden)`` ready to feed the
+        backbone as ``inputs_embeds`` for the next position.
+        """
+        emb = self._frame_embed(frame_codes.unsqueeze(1))  # (B, 1, hidden)
+        return emb
+
     def inference_stream(
         self,
         *,
+        info: dict[str, Any],
         text: str,
         max_new_frames: int = _DEFAULT_MAX_NEW_FRAMES,
         temperature: float = _DEFAULT_TEMPERATURE,
         top_k: int = _DEFAULT_TOP_K,
     ):
-        """Dual-AR frame generator (SKELETON; C2/C3 stubs).
+        """Dual-AR frame generator: yields ``(waveform_chunk, is_last)``.
 
-        Per the A2 design, one scheduler-visible CSM step == one full 80 ms
-        frame, which internally is:
-
-            backbone forward (1 new KV position)
+        Control flow (A2 §2), one iteration == one 80 ms frame:
+            (prefill once) backbone(text-prompt inputs_embeds)
+            per frame:
+              backbone step (1 new KV position) -> cb0 logits + last hidden
               -> sample cb0
-              -> 31-step inner depth-decoder AR loop (cb1..cb31)   [C2]
-              -> a 32-code frame
-              -> Mimi codec decode -> 1920 samples                  [C3]
-
-        For C1 this generator is wired up to the structure but the inner depth
-        loop and the Mimi decode raise NotImplementedError. The frame loop
-        below documents the exact control flow C2/C3 will fill in.
-
-        Yields ``(waveform_chunk, is_last)`` tuples.
+              -> 31-step depth loop (cb1..cb31)             [C2]
+              -> 32-code frame
+              -> EOS if cb0..cb30 all-zero (trim)           [A2 §2.4]
+              -> Mimi decode -> 1920 samples                [C3]
+              -> yield
         """
         device = self._device or torch.device("cpu")
+        backbone = self.backbone
+
+        # --- Prefill: embed the text prompt and run the backbone once. ---
+        prompt_embeds = self._embed_text_prompt(info)  # (1, T, hidden)
+        prompt_len = prompt_embeds.shape[1]
+        positions = torch.arange(prompt_len, device=device)
+        hidden = backbone.forward(
+            input_ids=None,
+            positions=positions,
+            inputs_embeds=prompt_embeds.squeeze(0),
+        )
+        # vLLM LlamaModel returns (sum_tokens, hidden); the last row is the
+        # next-token hidden state for our single (B=1) prefill sequence.
+        last_hidden = hidden[-1:].to(self._dtype)  # (1, hidden)
+        next_pos = prompt_len
 
         for _frame_idx in range(max_new_frames):
-            # --- 1. Backbone forward: 1 new KV position -> cb0 logits. ---
-            #     (C1 wires CsmBackbone; the per-frame embedding composition
-            #      — Σ over 32 codebooks into the (65632, 2048) frame-embed
-            #      table tied to the depth embed, A2 §2.4 — is a C3 item.)
-            #
-            # --- 2. Depth-decoder 31-step inner AR loop (cb1..cb31). ---
+            # --- 1. cb0 from the backbone last hidden state. ---
+            cb0_logits = backbone.cb0_head(last_hidden)  # (1, vocab)
+            cb0 = _sample_logits(cb0_logits, temperature, top_k)  # (1,)
+
+            # --- 2. 31-step depth loop -> cb1..cb31; assemble 32-code frame. ---
             frame_codes = self._run_depth_loop(
-                cb0=None,  # C2: backbone-sampled cb0 feeds the depth loop
+                cb0=cb0,
+                backbone_last_hidden_state=last_hidden,
                 temperature=temperature,
                 top_k=top_k,
-            )  # raises NotImplementedError (C2)
+            )  # (1, 32) Long
 
-            # --- 3. EOS check: a frame with cb0..cb30 all-zero is EOS. ---
-            #     (A2 §2.4; audio is trimmed at the first all-32-zero frame.)
-            #
-            # --- 4. Mimi codec decode: 32-code frame -> 1920 samples. ---
-            waveform_chunk = self._mimi_decode(frame_codes)  # NotImplementedError (C3)
+            # --- 3. EOS: a frame with cb0..cb30 all-zero is end-of-stream. ---
+            is_eos = bool(
+                (frame_codes[0, : self.num_codebooks - 1] == _CODEBOOK_EOS_ID).all().item()
+            )
+            if is_eos:
+                # Trim: do not emit audio for the terminal all-zero frame.
+                yield torch.zeros((0,), dtype=torch.float32, device=device), True
+                return
+
+            # --- 4. Mimi decode: 32-code frame -> 1920 PCM samples. ---
+            waveform_chunk = self._mimi_decode(frame_codes)  # (1920,) fp32
+
+            # --- 5. Feed the frame back as the next backbone position. ---
+            frame_embed = self._compose_frame_embed(frame_codes)  # (1, 1, hidden)
+            step_pos = torch.arange(next_pos, next_pos + 1, device=device)
+            hidden = backbone.forward(
+                input_ids=None,
+                positions=step_pos,
+                inputs_embeds=frame_embed.squeeze(0),
+            )
+            last_hidden = hidden[-1:].to(self._dtype)
+            next_pos += 1
 
             is_last = _frame_idx == max_new_frames - 1
             yield waveform_chunk, is_last
 
+        # max_new_frames reached without EOS.
         yield torch.zeros((0,), dtype=torch.float32, device=device), True
 
     def _run_depth_loop(
         self,
         *,
-        cb0: torch.Tensor | None,
+        cb0: torch.Tensor,
+        backbone_last_hidden_state: torch.Tensor,
         temperature: float,
         top_k: int,
     ) -> torch.Tensor:
-        """31-step inner depth-decoder AR loop -> a 32-code frame.
+        """31-step inner depth-decoder AR loop -> a 32-code frame (A2 §2.2).
 
-        C2 TODO. This is the dominant long pole (A2 §2.2 / §5):
+        The depth decoder (4 layers / d1024 / head_dim128) runs as custom dense
+        torch with its own DynamicCache, reset every frame (33 positions: the
+        backbone hidden at position 0, then cb0..cb31 at positions 1..32). It is
+        the dominant per-frame cost and the dominant difficulty.
 
-        - Depth decoder: 4 layers / d1024 / head_dim 128, dense static KV,
-          33 positions, reset per frame.
-        - Runs as custom dense torch INSIDE forward()/sample(), under the I3
-          no-sync discipline: NO ``.item()`` / ``.cpu()`` across the 31 inner
-          steps. Codes/flags are resolved with a packed-D2H / one-step-
-          lookahead so the inner loop never per-row-syncs (R0 §10).
-        - Batch the inner loop across the scheduler's in-flight lanes
-          (R0 §1 depth-loop batching); the backbone cohort batches per R0 §2
-          (right-pad whole-frame cohort).
-        - Returns the (num_codebooks,) — or (B, num_codebooks) — frame: cb0
-          from the backbone plus cb1..cb31 from this loop.
+        Numerics hygiene (PHASE3 §1): depth logits are cast to fp32 before EVERY
+        sample (inside ``_sample_logits``); the embed/head dtype is pinned to the
+        backbone dtype (set in ``_build_aux_modules``). Codes/flags are collected
+        into a per-step packed staging tensor and one D2H copy at the end of the
+        loop — NO per-step ``.item()`` / ``.cpu()`` scalar syncs (I3 / R0 §10).
+
+        SAFE path: per-lane B=1 (the correctness anchor). The signature and the
+        ``backbone_last_hidden_state`` / ``cb0`` shapes are kept ``(B, *)`` so a
+        future slot-indexed depth-batch across lanes (R0 §1) can be flipped on
+        by stacking lanes into the batch dim — mirroring sgl-omni's batched-depth
+        shape — without changing the loop body.
+
+        Returns ``(B, 32)`` Long: cb0 from the backbone plus cb1..cb31.
         """
-        raise NotImplementedError(
-            "C2: 31-step depth-decoder inner AR loop "
-            f"({_DEPTH_INNER_STEPS} steps -> {_NUM_CODEBOOKS}-code frame) "
-            "not implemented yet. See A2 §2.2."
-        )
+        from transformers.cache_utils import DynamicCache
+
+        depth = self._depth_decoder
+        device = cb0.device
+        bsz = cb0.shape[0]
+        n_steps = self.num_codebooks - 1  # 31
+
+        # Packed staging for codes (I3 / R0 §10): one (B, 32) tensor filled on
+        # device, with a single D2H at the end — no per-step host sync.
+        codes = torch.empty((bsz, self.num_codebooks), dtype=torch.long, device=device)
+        codes[:, 0] = cb0
+
+        past = DynamicCache(config=depth.config)
+        # Position 0 of the depth sequence is the backbone hidden state; the
+        # first depth input token is cb0. Pad a placeholder at position 0 that
+        # the depth model overwrites with ``backbone_last_hidden_state``.
+        cur_input = cb0.view(bsz, 1)  # (B, 1) = cb0
+        backbone_hs = backbone_last_hidden_state.view(bsz, self.hidden_size).to(self._dtype)
+
+        for step in range(n_steps):
+            # input_ids carries the previously sampled codebook token; on the
+            # first step we also pass backbone_last_hidden_state so the depth
+            # model seeds position 0 from the backbone hidden state.
+            depth_ids = cur_input
+            if step == 0:
+                # Prepend the position-0 placeholder (overwritten internally by
+                # backbone_last_hidden_state). Sequence is [hidden(pos0), cb0].
+                depth_ids = torch.nn.functional.pad(cur_input, (1, 0), value=0)  # (B,2)
+                out = depth(
+                    input_ids=depth_ids,
+                    backbone_last_hidden_state=backbone_hs,
+                    past_key_values=past,
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+            else:
+                out = depth(
+                    input_ids=depth_ids,
+                    past_key_values=past,
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+            past = out.past_key_values
+            # logits_to_keep=1 -> codebooks_head returns (B, 1, vocab) for the
+            # last position, i.e. the logits for codebook (step+1). The fp32
+            # cast happens inside _sample_logits (PHASE3 §1).
+            step_logits = out.logits[:, -1, :]  # (B, vocab)
+            next_code = _sample_logits(step_logits, temperature, top_k)  # (B,)
+            codes[:, step + 1] = next_code
+            cur_input = next_code.view(bsz, 1)
+
+        return codes
 
     def _mimi_decode(self, frame_codes: torch.Tensor) -> torch.Tensor:
-        """Mimi codec decode: a 32-code frame -> 1920 PCM samples (80 ms).
+        """Mimi codec decode: a 32-code frame -> 1920 PCM samples (A2 §2.3).
 
-        C3 TODO (A2 §2.3 / §5):
+        ``frame_codes`` is ``(B, 32)`` Long. Mimi.decode expects
+        ``(B, num_quantizers, codes_length)``; we decode one frame at a time
+        (codes_length == 1) and return a 1-D ``(1920,)`` fp32 waveform for B=1.
 
-        - Mimi: 24 kHz / 12.5 Hz, 80 ms = 1920-sample frames, 32 quantizers,
-          per-codebook vocab 2051 with reserved 2048/2049/2050 that must NEVER
-          reach Mimi (clamp/guard before decode).
-        - In the canonical 2-stage shape this becomes the Stage-1 decoder
-          implementing ``chunked_decode_streaming()``, wired through the
-          ar2decoder_async_chunk processor and the I1 consolidator. For the
-          single-stage scaffold it runs inline here.
+        Reserved guard: the per-codebook vocab is 2051 with reserved ids
+        2048/2049/2050 that must NEVER reach Mimi (its real codebook size is
+        2048). Clamp them to 0 before decode so the codec only ever sees valid
+        codebook entries.
         """
-        raise NotImplementedError(
-            f"C3: Mimi codec decode ({_NUM_CODEBOOKS}-code frame -> "
-            f"{_MIMI_SAMPLES_PER_FRAME} samples) not implemented yet. See A2 §2.3."
-        )
+        # Clamp on a COPY: the reserved ids 2048/2049/2050 are valid inputs to
+        # the (65632-entry) frame-embed table that feeds the next backbone step,
+        # so we must NOT mutate frame_codes in place — only the Mimi-bound copy
+        # is clamped to the codec's real [0, 2047] codebook range.
+        codes = frame_codes.clamp(min=0, max=_MIMI_CODEBOOK_SIZE - 1)
+        # (B, 32) -> (B, 32, 1): num_quantizers=32, codes_length=1.
+        audio_codes = codes.unsqueeze(-1)
+        with torch.no_grad():
+            out = self._mimi_codec.decode(audio_codes)
+        audio_values = out.audio_values  # (B, channels, samples) or (B, samples)
+        wav = audio_values.reshape(audio_values.shape[0], -1)[0]
+        return wav.to(torch.float32)
 
     # ------------------------------------------------------------------
     # Core forward pass (streaming, VoxCPM pattern)
