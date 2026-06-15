@@ -95,6 +95,13 @@ def _sample_logits(logits: torch.Tensor, temperature: float, top_k: int) -> torc
     masked fill) so a future CUDA-graph capture sees a stable reduction order.
     """
     logits = logits.float()
+    # Sampler hygiene: the backbone runs in bf16, so its cb0 logits (and the
+    # depth-decoder logits) can carry +/-inf or NaN. Left unsanitised these
+    # propagate through softmax and trip torch.multinomial's device-side assert
+    # ("probability tensor contains inf, nan or element < 0"). Replace
+    # non-finite logits with finite extremes before any softmax/argmax, exactly
+    # as vLLM's own sampler does (nan_to_num on the logits).
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
     if temperature is None or temperature <= 0.0:
         return torch.argmax(logits, dim=-1)
 
@@ -253,6 +260,10 @@ class CsmForGeneration(nn.Module):
         self._hf_config: Any = None  # authoritative HF CsmConfig (load_weights)
         self._device: torch.device | None = None
         self._dtype: torch.dtype = torch.float32
+        # Backbone (vLLM LlamaModel) compute dtype; resolved from the loaded
+        # backbone params in load_weights. inputs_embeds fed to the backbone are
+        # cast to this so the QKV/MLP matmuls see matching dtypes.
+        self._backbone_dtype: torch.dtype = torch.bfloat16
         self._lock = threading.Lock()
 
         # Per-request streaming generators (VoxCPM pattern).
@@ -288,7 +299,25 @@ class CsmForGeneration(nn.Module):
                 self._device = torch.device(
                     "cuda" if torch.cuda.is_available() else "cpu"
                 )
+            # Aux-module compute dtype (depth decoder + Mimi codec + frame/text
+            # embeds + the sampled-from logits). The dual-AR math was validated
+            # in fp32, so keep the aux path in the config dtype (fp32 unless the
+            # checkpoint pins otherwise) rather than the backbone's bf16.
             self._dtype = self.config.torch_dtype or torch.float32
+
+            # Backbone compute dtype: vLLM loads the native LlamaModel in the
+            # engine's chosen dtype (``model_config.dtype``; bf16 by default on
+            # this GPU), independent of the aux dtype. The synthetic
+            # ``inputs_embeds`` we feed the backbone (from the fp32 frame/text
+            # embed tables) MUST be cast to this dtype or the QKV matmul raises
+            # "mat1 and mat2 must have the same dtype". Read it from the actual
+            # loaded backbone parameters so it is always correct.
+            try:
+                self._backbone_dtype = next(self.backbone.parameters()).dtype
+            except StopIteration:
+                self._backbone_dtype = (
+                    self.vllm_config.model_config.dtype or self._dtype
+                )
 
             self._build_aux_modules()
 
@@ -326,32 +355,59 @@ class CsmForGeneration(nn.Module):
                 logger.warning("CSM load_weights: unrouted weight %s", name)
 
         # Backbone decoder layers + norm through vLLM's stacked-param loader.
-        loaded |= {
-            f"backbone_model.{n}"
-            for n in self.backbone.load_weights(iter(backbone_layer_weights))
-        }
+        # vLLM's load-completeness validator (default_loader.track_weights_loading)
+        # subtracts the set we return here from ``self.named_parameters()`` and
+        # raises if anything is left, so every name we return MUST be an ACTUAL
+        # REGISTERED parameter name (with the ``backbone.`` / leading-underscore
+        # aux prefixes), NOT the on-disk checkpoint name. The vLLM ``LlamaModel``
+        # loader returns names relative to itself (``model.layers.N.*``) and only
+        # credits the fused stacked params it touched (qkv/gate_up + the
+        # non-stacked layernorms it iterated); the cleaner contract for the outer
+        # validator is to credit every registered backbone parameter after the
+        # backbone load succeeds.
+        self.backbone.load_weights(iter(backbone_layer_weights))
+        loaded |= {n for n, _ in self.backbone.named_parameters(prefix="backbone")}
 
-        # cb0 head <- lm_head.weight.
+        # cb0 head <- lm_head.weight. (Registered under backbone.cb0_head; it is
+        # already covered by the backbone prefix sweep above, but load it here.)
         if "weight" in cb0_head_state:
             self._load_into(self.backbone.cb0_head, {"weight": cb0_head_state["weight"]})
 
-        # Frame-embed table + text-prompt embed via direct state load.
+        # Frame-embed table + text-prompt embed via direct state load. The
+        # modules are registered as ``self._frame_embed`` / ``self._text_embed``
+        # (leading underscore), so credit their real registered names.
         if self._frame_embed is not None and frame_embed_state:
-            self._frame_embed.load_state_dict(frame_embed_state, strict=False)
+            fe_missing, fe_unexpected = self._frame_embed.load_state_dict(
+                frame_embed_state, strict=False
+            )
+            if fe_unexpected:
+                logger.warning("CSM frame_embed unexpected keys: %s", fe_unexpected[:8])
+            loaded |= {n for n, _ in self._frame_embed.named_parameters(prefix="_frame_embed")}
         if self._text_embed is not None and text_embed_state:
             self._text_embed.load_state_dict(text_embed_state, strict=False)
+            loaded |= {n for n, _ in self._text_embed.named_parameters(prefix="_text_embed")}
 
-        # Depth decoder + Mimi codec via HF-style state-dict load.
+        # Depth decoder + Mimi codec via HF-style state-dict load. Registered as
+        # ``self._depth_decoder`` / ``self._mimi_codec`` (leading underscore).
         if self._depth_decoder is not None:
-            missing, unexpected = self._depth_decoder.load_state_dict(
+            dd_missing, dd_unexpected = self._depth_decoder.load_state_dict(
                 dict(depth_weights), strict=False
             )
-            if unexpected:
-                logger.warning("CSM depth_decoder unexpected keys: %s", unexpected[:8])
-            loaded |= {f"depth_decoder.{n}" for n, _ in depth_weights}
+            # The depth audio embed is intentionally NOT in the checkpoint under
+            # ``depth_decoder.*`` — it is tied to the backbone audio embed below
+            # (tie_codebooks_embeddings); so ``model.embed_tokens.weight`` is the
+            # only expected "missing" key here.
+            unexpected_dd = list(dd_unexpected)
+            if unexpected_dd:
+                logger.warning("CSM depth_decoder unexpected keys: %s", unexpected_dd[:8])
+            loaded |= {n for n, _ in self._depth_decoder.named_parameters(prefix="_depth_decoder")}
         if self._mimi_codec is not None:
-            self._mimi_codec.load_state_dict(dict(codec_weights), strict=False)
-            loaded |= {f"codec_model.{n}" for n, _ in codec_weights}
+            mc_missing, mc_unexpected = self._mimi_codec.load_state_dict(
+                dict(codec_weights), strict=False
+            )
+            if mc_unexpected:
+                logger.warning("CSM codec_model unexpected keys: %s", mc_unexpected[:8])
+            loaded |= {n for n, _ in self._mimi_codec.named_parameters(prefix="_mimi_codec")}
 
         # tie_codebooks_embeddings: depth embed table == backbone audio embed.
         self._maybe_tie_depth_embed()
@@ -528,16 +584,27 @@ class CsmForGeneration(nn.Module):
         hidden = backbone.forward(
             input_ids=None,
             positions=positions,
-            inputs_embeds=prompt_embeds.squeeze(0),
+            inputs_embeds=prompt_embeds.squeeze(0).to(self._backbone_dtype),
         )
         # vLLM LlamaModel returns (sum_tokens, hidden); the last row is the
-        # next-token hidden state for our single (B=1) prefill sequence.
-        last_hidden = hidden[-1:].to(self._dtype)  # (1, hidden)
+        # next-token hidden state for our single (B=1) prefill sequence. Keep it
+        # in the backbone dtype: it feeds the bf16 cb0_head (ParallelLMHead) next
+        # and the depth loop upcasts it to the aux dtype internally
+        # (_run_depth_loop casts backbone_last_hidden_state.to(self._dtype)).
+        last_hidden = hidden[-1:].to(self._backbone_dtype)  # (1, hidden)
         next_pos = prompt_len
 
         for _frame_idx in range(max_new_frames):
             # --- 1. cb0 from the backbone last hidden state. ---
-            cb0_logits = backbone.cb0_head(last_hidden)  # (1, vocab)
+            # vLLM's ParallelLMHead.forward is guarded ("LMHead's weights should
+            # be used in the sampler"); the supported path is to run the head
+            # through the LogitsProcessor, exactly as vLLM's own
+            # LlamaForCausalLM.compute_logits does
+            # (self.logits_processor(self.lm_head, hidden_states)). This applies
+            # the head's quant_method matmul + TP gather + vocab-pad trim.
+            cb0_logits = backbone.logits_processor(
+                backbone.cb0_head, last_hidden
+            )  # (1, vocab)
             cb0 = _sample_logits(cb0_logits, temperature, top_k)  # (1,)
 
             # --- 2. 31-step depth loop -> cb1..cb31; assemble 32-code frame. ---
@@ -566,9 +633,9 @@ class CsmForGeneration(nn.Module):
             hidden = backbone.forward(
                 input_ids=None,
                 positions=step_pos,
-                inputs_embeds=frame_embed.squeeze(0),
+                inputs_embeds=frame_embed.squeeze(0).to(self._backbone_dtype),
             )
-            last_hidden = hidden[-1:].to(self._dtype)
+            last_hidden = hidden[-1:].to(self._backbone_dtype)
             next_pos += 1
 
             is_last = _frame_idx == max_new_frames - 1

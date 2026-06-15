@@ -1,0 +1,36 @@
+# CSM-1B (Sesame) deploy: single-stage dual-AR TTS (~1.6B incl. Mimi codec).
+# Verified on 1x RTX 3060 12GB.
+#
+# Fields omitted from a stage fall back to StageDeployConfig defaults (see
+# vllm_omni/config/stage_config.py). Non-default choices in this file:
+#   * async_chunk: false — single-stage pipeline; no stage declares an
+#     async-chunk / next-stage input processor, so async_chunk must be off
+#     (merge_pipeline_deploy raises otherwise).
+#   * trust_remote_code: true — the Mimi codec + depth decoder are built via
+#     transformers AutoConfig/AutoModel from the checkpoint config.
+#   * enforce_eager: true — the per-frame body runs the 31-step depth decoder
+#     (DynamicCache) and the Mimi codec decode as dense torch with host syncs;
+#     CUDA-graph capture is not wired up for this control flow.
+#   * skip_mm_profiling: true — CSM takes a text prompt only (no multimodal
+#     input preprocessing), so skip the dummy-MM pass at profile time.
+#   * gpu_memory_utilization=0.6 — backbone (bf16) + depth decoder + Mimi codec
+#     fit comfortably under 12 GiB with KV for a 2048-token context.
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.6
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 2048
+    max_model_len: 2048
+    devices: "0"
+    skip_mm_profiling: true
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 1.0
+      top_k: 50
+      max_tokens: 2048
+      seed: 42

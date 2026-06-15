@@ -143,6 +143,19 @@ def build_backbone_llama_config(config: CsmConfig) -> LlamaConfig:
 
     ``vocab_size`` is the cb0 audio-token surface; the depth decoder (C2) and
     Mimi stage (C3) handle the remaining 31 codebooks and waveform synthesis.
+
+    Config-source note: ``config`` here is the **native** ``transformers``
+    ``CsmConfig`` (transformers >= 5.12 ships first-class CSM support), which is
+    authoritative for the backbone RoPE/attention facts and which carries the
+    typed nested ``depth_decoder_config`` / ``codec_config`` the C2/C3 aux
+    modules need (see ``CsmForGeneration._build_aux_modules``). We deliberately
+    do NOT register the vllm-omni ``CsmConfig`` over ``model_type="csm"`` (that
+    would (a) override ``AutoConfig.from_pretrained`` and break the aux-module
+    build, and (b) substitute hand-transcribed RoPE-scaling constants for the
+    checkpoint's real values). Instead we read ``rope_theta`` defensively: the
+    native config (and transformers >= 5.12 ``LlamaConfig``) folds ``rope_theta``
+    into ``rope_scaling`` / ``rope_parameters`` and exposes no top-level
+    ``rope_theta`` attribute, so we recover it from there.
     """
     rope_scaling = dict(config.rope_scaling) if config.rope_scaling else None
     if rope_scaling and "original_max_position_embeddings" in rope_scaling:
@@ -152,6 +165,24 @@ def build_backbone_llama_config(config: CsmConfig) -> LlamaConfig:
             rope_scaling["original_max_position_embeddings"],
             config.max_position_embeddings - 1,
         )
+
+    # transformers >= 5.12 unified the RoPE config: ``rope_theta`` is nested
+    # inside ``rope_scaling`` (key ``"rope_theta"``) and is NOT exposed as a
+    # top-level attribute on either the native ``CsmConfig`` or the resulting
+    # ``LlamaConfig``. Read it from ``rope_scaling`` first, then any top-level
+    # attribute (older configs / the vllm-omni hoisted config), then the public
+    # CSM-1B default. Keep it inside ``rope_scaling`` too so vLLM's
+    # ``get_rope`` (which reads ``rope_parameters[...]["rope_theta"]``) finds it.
+    rope_theta = None
+    if rope_scaling is not None:
+        rope_theta = rope_scaling.get("rope_theta")
+    if rope_theta is None:
+        rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_theta = _BACKBONE_ROPE_THETA
+    if rope_scaling is not None:
+        rope_scaling.setdefault("rope_theta", rope_theta)
+
     return LlamaConfig(
         hidden_size=config.hidden_size,
         num_hidden_layers=config.num_hidden_layers,
@@ -161,7 +192,7 @@ def build_backbone_llama_config(config: CsmConfig) -> LlamaConfig:
         intermediate_size=config.intermediate_size,
         max_position_embeddings=config.max_position_embeddings,
         vocab_size=config.vocab_size,
-        rope_theta=config.rope_theta,
+        rope_theta=rope_theta,
         rope_scaling=rope_scaling,
         tie_word_embeddings=config.tie_word_embeddings,
         hidden_act="silu",
