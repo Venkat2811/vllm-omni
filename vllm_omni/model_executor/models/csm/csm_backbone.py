@@ -245,7 +245,17 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         self._cached_sigma_by_req: dict[str, torch.Tensor] = {}
         # Per-request EOS latch so compute_logits can stop the scheduler on the
         # real frame-level EOS (cb0..cb30 all-zero) computed in forward().
+        # Kept for debugging only; NOT used for row mapping (dict order is
+        # first-seen insertion order, which is NOT the per-step sampler row
+        # order once a request finishes or requests arrive out of order).
         self._eos_by_req: dict[str, bool] = {}
+        # Authoritative EOS->logits-row mapping (unknown #2 fix). forward() fills
+        # this in EXACT batch-row order (the same order the runner gathers
+        # runtime_additional_information and the same order hidden_states are
+        # gathered into compute_logits' sample rows -- input_batch.req_ids).
+        # compute_logits consumes it positionally so EOS lands on the correct
+        # request's row even under concurrency / staggered finishes.
+        self._eos_flags_by_row: list[bool] = []
         # Per-request sampling params resolved at first preprocess.
         self._sampling_by_req: dict[str, tuple[float, int]] = {}
 
@@ -612,6 +622,10 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         num_reqs = max(0, int(qsl.numel()) - 1)
         device = hidden.device
         codes_out: list[torch.Tensor | None] = [None] * num_reqs
+        # Per-row EOS flags for THIS step, in batch-row order (unknown #2). Index
+        # i corresponds to sampler logits row i in compute_logits (both derive
+        # from input_batch.req_ids order). Default False (incl. dummy rows).
+        eos_flags_by_row: list[bool] = [False] * num_reqs
 
         for i in range(num_reqs):
             info = infos[i] if i < len(infos) else {}
@@ -644,6 +658,7 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             # the scheduler this step.
             is_eos = bool((frame_codes[0, : self.num_codebooks - 1] == _CODEBOOK_EOS_ID).all().item())
             self._eos_by_req[req_key] = is_eos
+            eos_flags_by_row[i] = is_eos  # authoritative row mapping (unknown #2)
 
             # Cache the next-frame Sigma-embed for this request (I5). On the
             # terminal EOS frame we still cache (harmless; freed at finish).
@@ -666,19 +681,27 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                 try:
                     import json as _json
 
+                    _rec = {
+                        "req": req_key,
+                        "eos": bool(is_eos),
+                        "frame": frame_codes[0].detach().cpu().tolist(),
+                    }
+                    # Drift probe (unknown #1): when VLLM_CSM_DUMP_HIDDEN is set,
+                    # also dump the backbone last-hidden-state row used to drive
+                    # cb0 + the inline depth loop, so an offline driver can diff
+                    # it against an HF-eager run on the same prefix (kernel-drift
+                    # signature: small ~1e-3 delta growing with t). Zero cost by
+                    # default; fp32 list for exact compare.
+                    if __import__("os").environ.get("VLLM_CSM_DUMP_HIDDEN"):
+                        _rec["hidden"] = last_hidden[0].detach().float().cpu().tolist()
                     with open(_dump, "a") as _fh:
-                        _fh.write(
-                            _json.dumps(
-                                {
-                                    "req": req_key,
-                                    "eos": bool(is_eos),
-                                    "frame": frame_codes[0].detach().cpu().tolist(),
-                                }
-                            )
-                            + "\n"
-                        )
+                        _fh.write(_json.dumps(_rec) + "\n")
                 except Exception:
                     pass
+
+        # Publish the per-row EOS mapping for compute_logits (called immediately
+        # after forward in the same step, same batch-row order). Unknown #2 fix.
+        self._eos_flags_by_row = eos_flags_by_row
 
         # text_hidden_states feeds compute_logits' sample-row gather; pass through.
         return OmniOutput(
@@ -729,9 +752,14 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             return None
 
         # Force EOS (token id 0) on rows whose frame was the real all-zero EOS.
-        # The AR runner gathers one sample row per request in batch order; map by
-        # position using the latch set in forward().
-        eos_flags = list(self._eos_by_req.values())
+        # The AR runner gathers one sample row per request in batch-row order
+        # (hidden_states[logits_indices], same order as input_batch.req_ids);
+        # forward() filled _eos_flags_by_row in that SAME order this step, so we
+        # map positionally (unknown #2 fix). Using dict.values() here was wrong:
+        # dict order is first-seen insertion order, which desyncs from the
+        # current sampler-row order once any request finishes or requests arrive
+        # out of order -> EOS could fire on the wrong request's row.
+        eos_flags = self._eos_flags_by_row
         num_rows = int(logits.shape[0])
         for row in range(num_rows):
             if row < len(eos_flags) and eos_flags[row]:
