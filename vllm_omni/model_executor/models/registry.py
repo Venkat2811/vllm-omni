@@ -249,6 +249,18 @@ _OMNI_MODELS = {
         "ming_flash_omni",
         "MingFlashOmniForConditionalGeneration",
     ),
+    ## CSM-1B (Sesame) — single-stage dual-AR TTS
+    "CsmForCausalLM": (
+        "csm",
+        "csm",
+        "CsmForGeneration",
+    ),
+    # Alias: HF transformers ships this architecture name in config.json
+    "CsmForConditionalGeneration": (
+        "csm",
+        "csm",
+        "CsmForGeneration",
+    ),
 }
 
 
