@@ -1616,12 +1616,42 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         text = f"<|begin_of_text|>[{speaker}]{request.input}<|end_of_text|>"
         prompt_token_ids = list(tokenizer(text, add_special_tokens=False)["input_ids"])
 
-        additional_information: dict[str, Any] = {"prompt_token_ids": prompt_token_ids}
-        # Forward the hard frame cap so the model's per-request backstop matches
-        # the scheduler's SamplingParams.max_tokens stop. Only set when the caller
-        # asked for one (ruff F841: every forwarded field is consumed model-side).
-        if request.max_new_tokens is not None:
-            additional_information["max_new_frames"] = request.max_new_tokens
+        # The backbone reads the conditioning ids back out of
+        # additional_information via ``_pick`` (csm_backbone.py), which unwraps
+        # the batch-of-1 convention by returning ``val[0]`` for any list value.
+        # The Stage-0 prefill MUST therefore receive the ids LIST-WRAPPED
+        # (``[prompt_token_ids]``) exactly like the offline driver
+        # (csm_2stage_offline.py build_request). Passing the BARE list made
+        # ``_pick`` return its first element -- the single ``<|begin_of_text|>``
+        # id -- so ``_embed_text_prompt`` embedded one BOS token and zero-padded
+        # the remaining prefill positions: the model saw NO text, generated a
+        # couple of garbage frames and hit the natural all-zero EOS after ~80 ms
+        # (the 1-2-frame truncated-audio bug). With the ids list-wrapped the full
+        # speaker-tagged text conditions the backbone and it runs to the natural
+        # end of the utterance.
+        additional_information: dict[str, Any] = {"prompt_token_ids": [prompt_token_ids]}
+        # Stage-0 sampling parity with the offline driver: the backbone resolves
+        # temperature/top_k from additional_information (else its do_sample
+        # defaults 0.9/top_k=50). Pin greedy (temperature=0, top_k=0) -- the same
+        # deterministic mode the offline 2-stage harness runs on these weights,
+        # and the mode the OSS CSM reference benches generate with. List-wrapped
+        # to match the same batch-of-1 ``_pick`` convention as the ids above.
+        additional_information["temperature"] = [0.0]
+        additional_information["top_k"] = [0]
+        # Frame cap: CSM-1B's custom inline-depth AR loop does NOT emit a reliable
+        # natural all-zero EOS frame -- under greedy it runs into a non-terminating
+        # saturating attractor, and under do_sample the EOS is bi-modal (fires for
+        # some utterances, not others). The offline 2-stage driver bounds this with
+        # an explicit max_new_frames=64 cap (5.12 s at 80 ms/frame), the length its
+        # WAVs were validated at. Mirror that here: honour an explicit
+        # request.max_new_tokens, else fall back to the offline default so served
+        # audio is bounded, full-length and deterministic (one 80 ms frame == one
+        # AR step; the backbone forces the frame EOS at the cap, see csm_backbone
+        # _DEFAULT_MAX_FRAMES / GATE-B). List-wrapped for the _pick batch-of-1
+        # convention.
+        _DEFAULT_CSM_MAX_FRAMES = 64
+        _max_frames = request.max_new_tokens if request.max_new_tokens is not None else _DEFAULT_CSM_MAX_FRAMES
+        additional_information["max_new_frames"] = [_max_frames]
 
         prompt = tokens_input(prompt_token_ids=prompt_token_ids)
         prompt["additional_information"] = additional_information
