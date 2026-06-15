@@ -249,17 +249,25 @@ _OMNI_MODELS = {
         "ming_flash_omni",
         "MingFlashOmniForConditionalGeneration",
     ),
-    ## CSM-1B (Sesame) — single-stage dual-AR TTS
-    "CsmForCausalLM": (
+    ## CSM-1B (Sesame) — 2-stage dual-AR TTS
+    # Stage 0: Llama backbone AR + inline 31-step depth decoder (LLM_AR).
+    "CsmBackboneForConditionalGeneration": (
         "csm",
-        "csm",
-        "CsmForGeneration",
+        "csm_backbone",
+        "CsmBackboneForConditionalGeneration",
     ),
-    # Alias: HF transformers ships this architecture name in config.json
+    # Stage 1: Mimi vocoder / code2wav (LLM_GENERATION).
+    "CsmMimiVocoder": (
+        "csm",
+        "csm_mimi",
+        "CsmMimiVocoder",
+    ),
+    # Alias: HF transformers ships this architecture name in config.json; route
+    # it to the Stage-0 backbone (the pipeline default arch).
     "CsmForConditionalGeneration": (
         "csm",
-        "csm",
-        "CsmForGeneration",
+        "csm_backbone",
+        "CsmBackboneForConditionalGeneration",
     ),
 }
 
