@@ -90,6 +90,18 @@ _DEFAULT_TOP_K = 50
 _NUM_CODEBOOKS = 32
 _CODEBOOK_EOS_ID = 0  # codebook_eos_token_id; a frame with cb0..cb30==0 is EOS.
 
+# Hard frame-cap fallback (GATE-B follow-up). One scheduler decode step == one
+# 80 ms frame, so the AR loop length is bounded by SamplingParams.max_tokens.
+# But CSM-1B at do_sample has a non-terminating greedy/repetition attractor that
+# can keep emitting non-EOS frames indefinitely; if the scheduler stop on
+# max_tokens ever races the in-flight async streaming step, a request can run
+# PAST its cap (observed: 113 frames at cap 64). This model-owned counter is the
+# fail-closed guard: forward() counts emitted frames per request and
+# compute_logits forces the frame EOS (token id 0) the step the count reaches the
+# cap, so the request ALWAYS stops at the cap even with no natural EOS frame.
+# 2048 mirrors the deploy default_sampling_params max_tokens for Stage 0.
+_DEFAULT_MAX_FRAMES = 2048
+
 
 def _pick(info: dict, key: str, default):
     """Extract scalar from additional_information dict (list or plain value)."""
@@ -110,11 +122,7 @@ def _req_key(info: dict[str, Any]) -> str:
     matches the key freed at finish time.
     """
     return str(
-        info.get("request_id")
-        or info.get("global_request_id")
-        or info.get("_omni_req_id")
-        or info.get("req_id")
-        or "0"
+        info.get("request_id") or info.get("global_request_id") or info.get("_omni_req_id") or info.get("req_id") or "0"
     )
 
 
@@ -258,6 +266,14 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         self._eos_flags_by_row: list[bool] = []
         # Per-request sampling params resolved at first preprocess.
         self._sampling_by_req: dict[str, tuple[float, int]] = {}
+        # GATE-B hard frame cap. _max_frames_by_req[req] is the resolved cap
+        # (from the request's SamplingParams.max_tokens, falling back to
+        # _DEFAULT_MAX_FRAMES); _frames_emitted_by_req[req] counts non-prefill
+        # frames surfaced from forward(). When the count reaches the cap,
+        # compute_logits forces the frame EOS for that request's row so the AR
+        # loop stops at the cap regardless of the natural all-zero EOS firing.
+        self._max_frames_by_req: dict[str, int] = {}
+        self._frames_emitted_by_req: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Weight loading (A3 §5; split: codec_model.* -> Stage 1)
@@ -491,6 +507,24 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             top_k = int(_pick(info_dict, "top_k", _DEFAULT_TOP_K))
             self._sampling_by_req[req_key] = (temperature, top_k)
 
+        # Resolve + cache the hard frame cap once (GATE-B). Prefer an explicit
+        # per-request cap forwarded via additional_information ("max_new_frames"
+        # or its "max_tokens" alias, set by the serving param-builder), else the
+        # deploy-level default. This is the fail-closed backstop to the
+        # scheduler's own SamplingParams.max_tokens stop.
+        if req_key not in self._max_frames_by_req:
+            cap = _pick(info_dict, "max_new_frames", None)
+            if cap is None:
+                cap = _pick(info_dict, "max_tokens", None)
+            try:
+                cap_int = int(cap) if cap is not None else _DEFAULT_MAX_FRAMES
+            except (TypeError, ValueError):
+                cap_int = _DEFAULT_MAX_FRAMES
+            if cap_int <= 0:
+                cap_int = _DEFAULT_MAX_FRAMES
+            self._max_frames_by_req[req_key] = cap_int
+            self._frames_emitted_by_req[req_key] = 0
+
         is_prefill_raw = info_dict.get("_omni_is_prefill")
         if isinstance(is_prefill_raw, bool):
             is_prefill = is_prefill_raw
@@ -552,15 +586,11 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         """
         ids_flat = input_ids.reshape(-1)
         if int(ids_flat.numel()) != len(req_infos):
-            raise ValueError(
-                f"preprocess_decode_batch expected {len(req_infos)} ids, got {int(ids_flat.numel())}"
-            )
+            raise ValueError(f"preprocess_decode_batch expected {len(req_infos)} ids, got {int(ids_flat.numel())}")
         out_ids: list[torch.Tensor] = []
         out_embeds: list[torch.Tensor] = []
         for i, info in enumerate(req_infos):
-            rid, remb, _ = self.preprocess(
-                input_ids=ids_flat[i : i + 1], input_embeds=None, **info
-            )
+            rid, remb, _ = self.preprocess(input_ids=ids_flat[i : i + 1], input_embeds=None, **info)
             out_ids.append(rid.reshape(-1)[:1])
             out_embeds.append(remb.reshape(1, -1))
         return torch.cat(out_ids, dim=0), torch.cat(out_embeds, dim=0), {}
@@ -656,7 +686,33 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             # Real frame EOS (A3 §5): cb0..cb30 all-zero. One host-read per frame
             # (outside the depth loop, I3-compliant). Latch so compute_logits stops
             # the scheduler this step.
-            is_eos = bool((frame_codes[0, : self.num_codebooks - 1] == _CODEBOOK_EOS_ID).all().item())
+            natural_eos = bool((frame_codes[0, : self.num_codebooks - 1] == _CODEBOOK_EOS_ID).all().item())
+
+            # GATE-B hard frame cap: count the frame we are about to surface and
+            # force a stop once the per-request cap is reached, even if the
+            # natural all-zero EOS never fires (the non-terminating greedy/
+            # repetition attractor). This is the fail-closed backstop to the
+            # scheduler's SamplingParams.max_tokens stop; it guarantees the AR
+            # loop ends at the cap and protects the server from unbounded
+            # requests. Distinct from natural_eos because a cap-forced frame is a
+            # REAL audio frame (keep it), whereas a natural EOS frame is all-zero
+            # (drop it).
+            emitted = self._frames_emitted_by_req.get(req_key, 0) + 1
+            self._frames_emitted_by_req[req_key] = emitted
+            cap = self._max_frames_by_req.get(req_key, _DEFAULT_MAX_FRAMES)
+            cap_forced = emitted >= cap and not natural_eos
+            if cap_forced:
+                logger.warning(
+                    "CSM req %s hit frame cap %d without a natural EOS frame; "
+                    "forcing stop (greedy non-terminating attractor guard).",
+                    req_key,
+                    cap,
+                )
+
+            # is_eos drives the scheduler stop for BOTH natural EOS and the
+            # cap-forced stop; the emit branch below keeps the cap-forced frame's
+            # audio but drops the all-zero natural-EOS frame.
+            is_eos = natural_eos or cap_forced
             self._eos_by_req[req_key] = is_eos
             eos_flags_by_row[i] = is_eos  # authoritative row mapping (unknown #2)
 
@@ -667,8 +723,11 @@ class CsmBackboneForConditionalGeneration(nn.Module):
 
             # Surface the finished 32-code frame forward to Stage 1 as latent.
             # Layout [F=1, 32] (frame-major; the stage processor flattens
-            # codebook-major). On EOS emit an empty frame so Stage 1 trims it.
-            if is_eos:
+            # codebook-major). On the NATURAL all-zero EOS emit an empty frame so
+            # Stage 1 trims it; on a CAP-FORCED stop the frame is real audio --
+            # keep it so the capped request still produces its final frame of
+            # speech (the cap bounds length, it does not truncate the last frame).
+            if natural_eos:
                 codes_out[i] = torch.zeros((0, self.num_codebooks), dtype=torch.long, device=device)
             else:
                 codes_out[i] = frame_codes.to(torch.long)  # (1, 32)
@@ -774,3 +833,5 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             self._cached_sigma_by_req.pop(key, None)
             self._eos_by_req.pop(key, None)
             self._sampling_by_req.pop(key, None)
+            self._max_frames_by_req.pop(key, None)
+            self._frames_emitted_by_req.pop(key, None)
