@@ -365,6 +365,24 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    # CSM-1B (Sesame): 2-stage dual-AR TTS (Stage 0 backbone AR + inline depth).
+    "CsmBackboneForConditionalGeneration": (
+        "csm",
+        "csm_backbone",
+        "CsmBackboneForConditionalGeneration",
+    ),
+    # Stage 1: Mimi vocoder / code2wav.
+    "CsmMimiVocoder": (
+        "csm",
+        "csm_mimi",
+        "CsmMimiVocoder",
+    ),
+    # Alias: HF config.json ships this arch name; route it to the Stage-0 backbone.
+    "CsmForConditionalGeneration": (
+        "csm",
+        "csm_backbone",
+        "CsmBackboneForConditionalGeneration",
+    ),
 }
 
 
