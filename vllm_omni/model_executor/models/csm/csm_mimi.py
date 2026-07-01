@@ -15,10 +15,10 @@ Invariants honored:
   * I1 (delta streaming): ``forward`` decodes ONLY this chunk's frames and emits
     the delta waveform; left context is trimmed off the front so chunk boundaries
     are seamless without re-emitting. Documented in ``forward``'s docstring.
-  * I5 (per-request state): Mimi's streaming conv-state is the known
-    "first-request-clean, later-requests-flicker" leak point (#233/#234). We use a
-    per-request streaming context keyed by req id; a shared buffer would cross-talk
-    under concurrency. Freed in ``on_requests_finished``.
+  * I5 (per-request state): this stage holds NO per-request state. Each call
+    decodes its chunk stateless-ly (full chunk + left context, trim), so there
+    is nothing to leak across requests. Persistent per-request Mimi conv-state
+    arrives with the async-chunk streaming follow-up.
   * "All return paths emit model_outputs" (SKILL): every branch returns an
     ``OmniOutput`` with a ``model_outputs`` list of matching length.
 
@@ -73,9 +73,6 @@ class CsmMimiVocoder(nn.Module):
         self._mimi_codec: nn.Module | None = None  # MimiModel
         self._device: torch.device | None = None
         self._lock = threading.Lock()
-
-        # I5: per-request Mimi streaming conv-state, keyed by req id.
-        self._stream_state_by_req: dict[str, Any] = {}
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # Vocoder ignores token embeddings; stable dummy for the runner.
@@ -251,7 +248,3 @@ class CsmMimiVocoder(nn.Module):
             return OmniOutput(*model_outputs)
         raise TypeError(f"CsmMimiVocoder expected OmniOutput, got {type(model_outputs)}")
 
-    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
-        """Free per-request Mimi streaming state on finish (I5, #233/#234)."""
-        for req_id in finished_req_ids:
-            self._stream_state_by_req.pop(str(req_id), None)

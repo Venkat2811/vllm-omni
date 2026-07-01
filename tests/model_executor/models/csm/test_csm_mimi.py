@@ -53,7 +53,6 @@ def _make_vocoder() -> CsmMimiVocoder:
     v.sample_rate = 24000
     v._device = torch.device("cpu")
     v.config = SimpleNamespace(codec_samples_per_frame=_SAMPLES_PER_FRAME)
-    v._stream_state_by_req = {}
     v._mimi_codec = _FakeCodec()
     return v
 
@@ -158,12 +157,12 @@ def test_forward_mixed_valid_and_malformed_keeps_indices_aligned():
     assert audios[1].numel() == 0
 
 
-def test_on_requests_finished_frees_stream_state():
+def test_vocoder_holds_no_per_request_state():
+    """The chunk decode is stateless (decode chunk + left context, trim), so the
+    stage must not carry per-request attrs that imply otherwise. Persistent
+    per-request Mimi conv-state arrives with the async-chunk follow-up."""
     v = _make_vocoder()
-    v._stream_state_by_req = {"a": object(), "b": object()}
-    v.on_requests_finished(["a"])
-    assert "a" not in v._stream_state_by_req
-    assert "b" in v._stream_state_by_req
+    assert not hasattr(v, "_stream_state_by_req")
 
 
 def test_make_omni_output_passthrough_and_rejects_bad_type():
