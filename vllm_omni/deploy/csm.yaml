@@ -64,6 +64,10 @@ stages:
     trust_remote_code: true
     enable_prefix_caching: false
     max_num_batched_tokens: 65536
+    # 65536 exceeds the codec's derived max (2048), so boot warns that long
+    # positions can produce NaNs. Safe here: Mimi is a non-AR vocoder with no
+    # RoPE dependence on prefill length; the long max only sizes the
+    # codebook-major codes prefill ([32 * F] tokens for long utterances).
     max_model_len: 65536
     devices: "0"
     default_sampling_params:
