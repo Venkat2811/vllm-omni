@@ -208,6 +208,13 @@ class CsmBackboneForConditionalGeneration(nn.Module):
     has_preprocess = True
     has_postprocess = True
     enable_update_additional_information = True
+    # Async Omni output materialization (#4476), talker-style: Stage 0 ships
+    # only the finished 32-code frames to the Mimi stage and consumes the
+    # backbone hidden state inline (cb0 + depth), so skip the per-step hidden
+    # D2H in the pooler payload and materialize outputs asynchronously.
+    use_async_omni_output = True
+    eager_omni_postprocess_before_async_output = True
+    omni_pooler_payload_include_hidden = False
     inject_omni_request_id_into_runtime_info = True
 
     packed_modules_mapping = CsmBackbone.packed_modules_mapping
