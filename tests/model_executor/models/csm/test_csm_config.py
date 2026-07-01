@@ -114,3 +114,54 @@ def test_explicit_backbone_overrides_are_honored():
     assert llama.hidden_size == 1536
     assert llama.num_hidden_layers == 12
     assert llama.vocab_size == 4096
+
+
+def test_from_pretrained_on_real_transformers_config_layout(tmp_path):
+    """Regression: ``from_pretrained`` on the real checkpoint layout.
+
+    The transformers-format CSM-1B config carries ``rope_scaling`` /
+    ``rope_theta`` / ``max_position_embeddings`` at the TOP level with no
+    nested ``backbone_config``. transformers >= 5.12 standardizes rope
+    parameters inside ``PretrainedConfig.__init__`` and reads
+    ``max_position_embeddings`` during that pass, so assigning those fields
+    only after ``super().__init__`` raised AttributeError on this path."""
+    import json
+
+    real_layout = {
+        "model_type": "csm",
+        "architectures": ["CsmForConditionalGeneration"],
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "intermediate_size": 8192,
+        "max_position_embeddings": 2048,
+        "rope_theta": 500000.0,
+        "rope_scaling": {
+            "factor": 32.0,
+            "high_freq_factor": 0.5,
+            "low_freq_factor": 0.125,
+            "original_max_position_embeddings": 1024,
+            "rope_type": "llama3",
+        },
+        "vocab_size": 2051,
+        "num_codebooks": 32,
+        "tie_word_embeddings": True,
+        "depth_decoder_config": {"hidden_size": 1024, "num_hidden_layers": 4},
+        "codec_config": {"sample_rate": 24000, "frame_rate": 12.5},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(real_layout))
+
+    cfg = CsmConfig.from_pretrained(tmp_path)  # raised AttributeError pre-fix
+
+    assert cfg.max_position_embeddings == 2048
+    rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
+    assert rope is not None
+    assert float(rope["factor"]) == 32.0
+    # Nested sections still land where the depth loop / Mimi stage read them.
+    assert cfg.depth_hidden_size == 1024
+    assert cfg.codec_sample_rate == 24000
+    # And the recovered config still synthesizes a valid backbone LlamaConfig.
+    llama = build_backbone_llama_config(cfg)
+    assert llama.max_position_embeddings == 2048

@@ -85,6 +85,20 @@ class CsmConfig(PretrainedConfig):
         if hasattr(codec_cfg, "to_dict"):
             codec_cfg = codec_cfg.to_dict()
 
+        # Position/rope fields must exist BEFORE ``super().__init__``:
+        # transformers >= 5.12 standardizes rope parameters inside
+        # ``PretrainedConfig.__init__`` and reads ``max_position_embeddings``
+        # during that pass, so assigning them afterwards breaks
+        # ``from_pretrained`` on a real config.json with AttributeError.
+        # Backbone values win over top-level duplicates, which are popped so
+        # the parent does not re-process a conflicting copy.
+        kwargs_mpe = kwargs.pop("max_position_embeddings", _BACKBONE_MAX_POSITION_EMBEDDINGS)
+        kwargs_rope_theta = kwargs.pop("rope_theta", _BACKBONE_ROPE_THETA)
+        kwargs_rope_scaling = kwargs.pop("rope_scaling", dict(_BACKBONE_ROPE_SCALING))
+        self.max_position_embeddings = backbone_cfg.get("max_position_embeddings", kwargs_mpe)
+        self.rope_theta = backbone_cfg.get("rope_theta", kwargs_rope_theta)
+        self.rope_scaling = backbone_cfg.get("rope_scaling", kwargs_rope_scaling)
+
         super().__init__(**kwargs)
 
         # --- Backbone parameters (hoisted to top level for vLLM) ---
@@ -94,9 +108,6 @@ class CsmConfig(PretrainedConfig):
         self.num_key_value_heads = backbone_cfg.get("num_key_value_heads", _BACKBONE_NUM_KV_HEADS)
         self.head_dim = backbone_cfg.get("head_dim", _BACKBONE_HEAD_DIM)
         self.intermediate_size = backbone_cfg.get("intermediate_size", _BACKBONE_INTERMEDIATE_SIZE)
-        self.max_position_embeddings = backbone_cfg.get("max_position_embeddings", _BACKBONE_MAX_POSITION_EMBEDDINGS)
-        self.rope_theta = backbone_cfg.get("rope_theta", _BACKBONE_ROPE_THETA)
-        self.rope_scaling = backbone_cfg.get("rope_scaling", dict(_BACKBONE_ROPE_SCALING))
         # tie_word_embeddings avoids a dead ~525 MB text head (A2 §2.1).
         self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
 
