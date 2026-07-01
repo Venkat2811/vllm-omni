@@ -18,6 +18,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 # Every dedicated TTS model-type must have an adapter so the orchestrator's
 # uniform ``self._adapter.build(...)`` dispatch covers it.
 EXPECTED_MODEL_TYPES = {
+    "csm",
     "qwen3_tts",
     "voxcpm2",
     "voxtral_tts",
@@ -95,6 +96,65 @@ def test_diffusion_adapter_extra_body_params_fallback():
             raise NotImplementedError
 
     assert _DiffAdapter.extra_body_params() == frozenset()
+
+
+def _speech_request(**overrides):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+    fields = {"model": "sesame/csm-1b", "input": "Hello there."}
+    fields.update(overrides)
+    return OpenAICreateSpeechRequest(**fields)
+
+
+def test_csm_metadata():
+    from vllm_omni.entrypoints.openai.tts_adapters.csm import CsmTTSAdapter
+
+    assert resolve_adapter("csm") is CsmTTSAdapter
+    assert CsmTTSAdapter.backend == "ar"
+    assert issubclass(CsmTTSAdapter, ARTTSAdapter)
+
+
+def test_csm_validate_sampling_extras():
+    from vllm_omni.entrypoints.openai.tts_adapters.csm import CsmTTSAdapter
+
+    check = CsmTTSAdapter._validate_sampling_extras
+    assert check(_speech_request()) is None
+    assert check(_speech_request(extra_params={"temperature": 0.7, "top_k": 40})) is None
+    assert check(_speech_request(extra_params={"temperature": 0.0, "top_k": 0})) is None
+    assert "temperature" in check(_speech_request(extra_params={"temperature": 3.0}))
+    assert "temperature" in check(_speech_request(extra_params={"temperature": "hot"}))
+    assert "top_k" in check(_speech_request(extra_params={"top_k": -1}))
+    assert "top_k" in check(_speech_request(extra_params={"top_k": 1.5}))
+    assert "top_k" in check(_speech_request(extra_params={"top_k": True}))
+
+
+@pytest.mark.asyncio
+async def test_csm_build_carries_sampling_and_frame_cap():
+    """``build`` mirrors extra_params sampling (HF-reference defaults) and the
+    frame cap into ``additional_information``, list-wrapped for ``_pick``."""
+    from vllm_omni.entrypoints.openai.tts_adapters.csm import (
+        _DEFAULT_CSM_MAX_FRAMES,
+        _DEFAULT_TEMPERATURE,
+        _DEFAULT_TOP_K,
+        CsmTTSAdapter,
+    )
+
+    adapter = CsmTTSAdapter.__new__(CsmTTSAdapter)
+    adapter._tokenizer = lambda text, add_special_tokens=False: {"input_ids": [1, 2, 3]}
+
+    prepared = await adapter.build(_speech_request(), [], False)
+    info = prepared.prompt["additional_information"]
+    assert info["temperature"] == [_DEFAULT_TEMPERATURE]
+    assert info["top_k"] == [_DEFAULT_TOP_K]
+    assert info["max_new_frames"] == [_DEFAULT_CSM_MAX_FRAMES]
+    assert info["prompt_token_ids"] == [[1, 2, 3]]
+
+    greedy = _speech_request(extra_params={"temperature": 0.0, "top_k": 0}, max_new_tokens=64)
+    prepared = await adapter.build(greedy, [], False)
+    info = prepared.prompt["additional_information"]
+    assert info["temperature"] == [0.0]
+    assert info["top_k"] == [0]
+    assert info["max_new_frames"] == [64]
 
 
 if __name__ == "__main__":

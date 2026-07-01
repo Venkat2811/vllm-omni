@@ -32,12 +32,21 @@ logger = init_logger(__name__)
 # Request bounds (mirror serving_speech._TTS_MAX_NEW_TOKENS_{MIN,MAX}).
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
-# CSM-1B's inline-depth AR loop has no reliable natural EOS (greedy hits a
-# non-terminating saturating attractor; do_sample EOS is bi-modal). Bound served
-# audio with the cap the offline 2-stage harness validated its WAVs at
-# (64 frames == 5.12 s at 80 ms/frame). The backbone forces the frame EOS at the
-# cap (csm_backbone _DEFAULT_MAX_FRAMES / GATE-B).
-_DEFAULT_CSM_MAX_FRAMES = 64
+# Served sampling defaults mirror the HF reference generation config
+# (temperature 0.9, top_k 50). Sampling reaches the model's natural all-zero
+# EOS frame far more reliably than greedy, which can fall into CSM's
+# non-terminating repetition attractor and run to the frame cap with a silent
+# tail. Callers override per request via ``extra_params``, e.g.
+# ``{"temperature": 0.0, "top_k": 0}`` for deterministic greedy output.
+_DEFAULT_TEMPERATURE = 0.9
+_DEFAULT_TOP_K = 50
+_TEMPERATURE_MAX = 2.0
+_TOP_K_MAX = 2048
+# Fail-closed frame cap for rollouts that never emit a natural EOS (125 frames
+# == 10 s at 80 ms/frame, the CSM reference cap). The backbone forces the frame
+# EOS at the cap (csm_backbone _DEFAULT_MAX_FRAMES / GATE-B); ``max_new_tokens``
+# overrides it per request.
+_DEFAULT_CSM_MAX_FRAMES = 125
 
 
 @register_tts_adapter
@@ -76,6 +85,28 @@ class CsmTTSAdapter(ARTTSAdapter):
                 return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
             if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
                 return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+        return self._validate_sampling_extras(request)
+
+    @staticmethod
+    def _validate_sampling_extras(request: "OpenAICreateSpeechRequest") -> str | None:
+        """Validate the CSM sampling knobs carried in ``extra_params``."""
+        extras = request.extra_params
+        if extras is None:
+            return None
+        if not isinstance(extras, dict):
+            return "extra_params must be a JSON object"
+        temperature = extras.get("temperature")
+        if temperature is not None:
+            if not isinstance(temperature, (int, float)) or isinstance(temperature, bool):
+                return "extra_params.temperature must be a number"
+            if not 0.0 <= float(temperature) <= _TEMPERATURE_MAX:
+                return f"extra_params.temperature must be in [0, {_TEMPERATURE_MAX}]"
+        top_k = extras.get("top_k")
+        if top_k is not None:
+            if not isinstance(top_k, int) or isinstance(top_k, bool):
+                return "extra_params.top_k must be an integer"
+            if not 0 <= top_k <= _TOP_K_MAX:
+                return f"extra_params.top_k must be in [0, {_TOP_K_MAX}]"
         return None
 
     async def build(
@@ -91,20 +122,28 @@ class CsmTTSAdapter(ARTTSAdapter):
         ``_pick`` (csm_backbone), which unwraps the batch-of-1 convention by
         returning ``val[0]`` for list values, so every field is LIST-WRAPPED (a
         bare list would make ``_pick`` return only the first id, embedding one BOS
-        token and zero-padding the rest: the 1-2-frame truncated-audio bug). Stage
-        0 runs greedy (temperature 0, top_k 0) for deterministic validated output,
-        and an explicit ``max_new_frames`` cap bounds the non-terminating AR loop.
+        token and zero-padding the rest: the 1-2-frame truncated-audio bug).
+
+        Sampling: ``temperature`` / ``top_k`` come from ``request.extra_params``
+        (validated above) and drive both cb0 and the inline depth decoder, with
+        HF-reference defaults. They travel via ``additional_information`` because
+        CSM samples inside the model (``sample_logits`` + ``depth.run``), not
+        through the engine ``SamplingParams``. ``max_new_frames`` bounds a
+        rollout that never reaches natural EOS.
         """
         tokenizer = self._get_tokenizer()
         speaker = str(request.voice).strip() if request.voice is not None else "0"
         text = f"<|begin_of_text|>[{speaker}]{request.input}<|end_of_text|>"
         prompt_token_ids = list(tokenizer(text, add_special_tokens=False)["input_ids"])
 
+        extras = request.extra_params if isinstance(request.extra_params, dict) else {}
+        temperature = float(extras.get("temperature", _DEFAULT_TEMPERATURE))
+        top_k = int(extras.get("top_k", _DEFAULT_TOP_K))
         max_frames = request.max_new_tokens if request.max_new_tokens is not None else _DEFAULT_CSM_MAX_FRAMES
         additional_information: dict[str, Any] = {
             "prompt_token_ids": [prompt_token_ids],
-            "temperature": [0.0],
-            "top_k": [0],
+            "temperature": [temperature],
+            "top_k": [top_k],
             "max_new_frames": [max_frames],
         }
 
