@@ -557,9 +557,7 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         # hook saw the runner-stamped request_id.)
         if is_prefill and not is_dummy:
             missing = []
-            if not any(
-                info_dict.get(k) for k in ("request_id", "global_request_id", "_omni_req_id", "req_id")
-            ):
+            if not any(info_dict.get(k) for k in ("request_id", "global_request_id", "_omni_req_id", "req_id")):
                 missing.append("request_id")
             if _pick(info_dict, "prompt_token_ids", None) is None:
                 missing.append("prompt_token_ids")

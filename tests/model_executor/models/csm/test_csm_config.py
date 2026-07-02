@@ -122,7 +122,9 @@ def test_original_max_position_passes_through_unclamped():
     llama = build_backbone_llama_config(CsmConfig())
     assert llama.rope_scaling["original_max_position_embeddings"] == 1024
 
-    big = CsmConfig(backbone_config={"rope_scaling": {**dict(CsmConfig().rope_scaling), "original_max_position_embeddings": 8192}})
+    big = CsmConfig(
+        backbone_config={"rope_scaling": {**dict(CsmConfig().rope_scaling), "original_max_position_embeddings": 8192}}
+    )
     llama_big = build_backbone_llama_config(big)
     assert llama_big.rope_scaling["original_max_position_embeddings"] == 8192
 
@@ -272,6 +274,7 @@ def test_save_pretrained_round_trip_preserves_hoisted_fields(tmp_path):
         assert getattr(reloaded, name) == value, name
     assert reloaded.tie_word_embeddings is False
     assert reloaded.rope_scaling["low_freq_factor"] == cfg.rope_scaling["low_freq_factor"]
-    assert reloaded.rope_scaling["original_max_position_embeddings"] == (
-        cfg.rope_scaling["original_max_position_embeddings"]
+    assert (
+        reloaded.rope_scaling["original_max_position_embeddings"]
+        == (cfg.rope_scaling["original_max_position_embeddings"])
     )

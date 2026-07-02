@@ -66,9 +66,7 @@ def _make_backbone() -> CsmBackboneForConditionalGeneration:
     m.backbone = SimpleNamespace(logits_processor=_FakeLogitsProcessor(), cb0_head=object())
     # Codebook-0 embedding table stub (the no-cache decode fallback does a
     # direct embed_audio_tokens lookup).
-    m._frame_embed = SimpleNamespace(
-        embed_audio_tokens=lambda ids: torch.zeros(int(ids.shape[0]), _HIDDEN)
-    )
+    m._frame_embed = SimpleNamespace(embed_audio_tokens=lambda ids: torch.zeros(int(ids.shape[0]), _HIDDEN))
     return m
 
 
@@ -633,9 +631,7 @@ def test_forward_threads_seeded_generator_into_cb0_and_depth(monkeypatch):
         )[1],
     )
     depth_kwargs = {}
-    m.depth = SimpleNamespace(
-        run=lambda **kw: (depth_kwargs.update(kw), torch.ones(1, 32, dtype=torch.long))[1]
-    )
+    m.depth = SimpleNamespace(run=lambda **kw: (depth_kwargs.update(kw), torch.ones(1, 32, dtype=torch.long))[1])
     monkeypatch.setattr(
         "vllm.forward_context.get_forward_context",
         lambda: SimpleNamespace(attn_metadata=None),
