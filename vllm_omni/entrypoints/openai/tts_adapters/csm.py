@@ -7,9 +7,6 @@ the AR engine_client path. The OpenAI ``voice`` field maps to a CSM speaker id
 voice cloning on this path. The adapter owns request validation and Stage-0
 backbone prompt construction for the two-stage CSM pipeline (backbone AR +
 inline 31-step depth -> Mimi code2wav; see ``model_executor/models/csm``).
-
-Drop-in for vllm_omni/entrypoints/openai/tts_adapters/csm.py and add ``csm`` to
-the import list in that package's __init__.py.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -29,9 +26,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Request bounds (mirror serving_speech._TTS_MAX_NEW_TOKENS_{MIN,MAX}).
+# Request bounds. The minimum mirrors serving_speech._TTS_MAX_NEW_TOKENS_MIN;
+# the maximum is CSM's OWN ceiling, not the generic 4096 TTS cap: one decode
+# step == one frame, and the backbone context is 2048 positions (csm.yaml
+# stage-0 max_model_len, mirrored by csm_backbone._DEFAULT_MAX_FRAMES), so any
+# larger value would pass validation yet silently truncate at the engine
+# length stop.
 _TTS_MAX_NEW_TOKENS_MIN = 1
-_TTS_MAX_NEW_TOKENS_MAX = 4096
+_CSM_MAX_NEW_TOKENS_MAX = 2048
 # Served sampling defaults mirror the HF reference generation config
 # (temperature 0.9, top_k 50). Sampling reaches the model's natural all-zero
 # EOS frame far more reliably than greedy, which can fall into CSM's
@@ -83,8 +85,8 @@ class CsmTTSAdapter(ARTTSAdapter):
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
                 return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
-            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
-                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+            if request.max_new_tokens > _CSM_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_CSM_MAX_NEW_TOKENS_MAX}"
         return self._validate_sampling_extras(request)
 
     @staticmethod
@@ -140,8 +142,14 @@ class CsmTTSAdapter(ARTTSAdapter):
         prompt_token_ids = list(tokenizer(text, add_special_tokens=False)["input_ids"])
 
         extras = request.extra_params if isinstance(request.extra_params, dict) else {}
-        temperature = float(extras.get("temperature", _DEFAULT_TEMPERATURE))
-        top_k = int(extras.get("top_k", _DEFAULT_TOP_K))
+        # Explicit JSON nulls mean "not provided" (typed SDKs serialize unset
+        # optionals as null). _validate_sampling_extras skips None the same
+        # way, so validate() and build() agree and float(None)/int(None) can
+        # never crash a request that passed validation.
+        raw_temperature = extras.get("temperature")
+        temperature = _DEFAULT_TEMPERATURE if raw_temperature is None else float(raw_temperature)
+        raw_top_k = extras.get("top_k")
+        top_k = _DEFAULT_TOP_K if raw_top_k is None else int(raw_top_k)
         max_frames = request.max_new_tokens if request.max_new_tokens is not None else _DEFAULT_CSM_MAX_FRAMES
         additional_information: dict[str, Any] = {
             "prompt_token_ids": [prompt_token_ids],

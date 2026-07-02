@@ -15,6 +15,11 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 
+# Pure-Python registry/adapter logic (no model/GPU load), so the CPU
+# core_model lanes must select this file -- unmarked tests are deselected by
+# every marker-filtered CI lane.
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 # Every dedicated TTS model-type must have an adapter so the orchestrator's
 # uniform ``self._adapter.build(...)`` dispatch covers it.
 EXPECTED_MODEL_TYPES = {
@@ -126,6 +131,47 @@ def test_csm_validate_sampling_extras():
     assert "top_k" in check(_speech_request(extra_params={"top_k": -1}))
     assert "top_k" in check(_speech_request(extra_params={"top_k": 1.5}))
     assert "top_k" in check(_speech_request(extra_params={"top_k": True}))
+    # Explicit JSON null means "not provided" -- accepted here, and build()
+    # must apply the defaults (test below), so validate/build agree.
+    assert check(_speech_request(extra_params={"temperature": None})) is None
+    assert check(_speech_request(extra_params={"top_k": None})) is None
+
+
+def test_csm_validate_max_new_tokens_bounded_by_backbone_context():
+    """The cap is CSM's real 2048-position ceiling (one decode step == one
+    frame, csm.yaml stage-0 max_model_len), NOT the generic 4096 TTS cap:
+    values in (2048, 4096] passed validation but silently truncated at the
+    engine length stop."""
+    from vllm_omni.entrypoints.openai.tts_adapters.csm import CsmTTSAdapter
+
+    adapter = CsmTTSAdapter.__new__(CsmTTSAdapter)
+    assert adapter.validate(_speech_request(max_new_tokens=2048)) is None
+    assert "2048" in adapter.validate(_speech_request(max_new_tokens=2049))
+    assert "2048" in adapter.validate(_speech_request(max_new_tokens=4096))
+    assert "at least" in adapter.validate(_speech_request(max_new_tokens=0))
+
+
+@pytest.mark.asyncio
+async def test_csm_build_treats_explicit_null_extras_as_absent():
+    """extra_params {"temperature": null, "top_k": null} passes validation
+    (None == not provided), so build() must apply the defaults instead of
+    crashing on float(None)/int(None) -- pre-fix this turned a validated
+    request into an internal error."""
+    from vllm_omni.entrypoints.openai.tts_adapters.csm import (
+        _DEFAULT_TEMPERATURE,
+        _DEFAULT_TOP_K,
+        CsmTTSAdapter,
+    )
+
+    request = _speech_request(extra_params={"temperature": None, "top_k": None})
+    assert CsmTTSAdapter._validate_sampling_extras(request) is None
+
+    adapter = CsmTTSAdapter.__new__(CsmTTSAdapter)
+    adapter._tokenizer = lambda text, add_special_tokens=False: {"input_ids": [1, 2, 3]}
+    prepared = await adapter.build(request, [], False)
+    info = prepared.prompt["additional_information"]
+    assert info["temperature"] == [_DEFAULT_TEMPERATURE]
+    assert info["top_k"] == [_DEFAULT_TOP_K]
 
 
 @pytest.mark.asyncio
