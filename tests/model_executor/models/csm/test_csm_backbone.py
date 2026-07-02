@@ -60,6 +60,7 @@ def _make_backbone() -> CsmBackboneForConditionalGeneration:
     m._eos_by_req = {}
     m._cached_sigma_by_req = {}
     m._sampling_by_req = {}
+    m._generator_by_req = {}
     m._max_frames_by_req = {}
     m._frames_emitted_by_req = {}
     m.backbone = SimpleNamespace(logits_processor=_FakeLogitsProcessor(), cb0_head=object())
@@ -334,11 +335,122 @@ def test_on_requests_finished_frees_all_per_request_state():
     m._cached_sigma_by_req = {"r": torch.zeros(1)}
     m._eos_by_req = {"r": True}
     m._sampling_by_req = {"r": (0.9, 50)}
+    m._generator_by_req = {"r": torch.Generator()}
     m._max_frames_by_req = {"r": 64}
     m._frames_emitted_by_req = {"r": 5}
     m.on_requests_finished(["r"])
     assert m._cached_sigma_by_req == {}
     assert m._eos_by_req == {}
     assert m._sampling_by_req == {}
+    assert m._generator_by_req == {}
     assert m._max_frames_by_req == {}
     assert m._frames_emitted_by_req == {}
+
+
+# --------------------------------------------------------------------------
+# request.seed -> per-request generator (in-model sampling determinism)
+# --------------------------------------------------------------------------
+
+
+def test_preprocess_seed_creates_per_request_generator_once():
+    m = _make_backbone()
+    m.config = SimpleNamespace(vocab_size=2051)
+    m._compose_frame_embed = lambda fc: torch.zeros(1, _HIDDEN)
+    m.preprocess(
+        input_ids=torch.tensor([7], dtype=torch.long),
+        input_embeds=None,
+        request_id="rs",
+        _omni_is_prefill=False,
+        seed=[1234],
+        temperature=[0.9],
+        top_k=[50],
+    )
+    assert "rs" in m._generator_by_req
+    gen_first = m._generator_by_req["rs"]
+    # Later steps of the same request must keep the SAME generator (its state
+    # is the request's RNG stream; recreating it would replay draws).
+    m.preprocess(
+        input_ids=torch.tensor([7], dtype=torch.long),
+        input_embeds=None,
+        request_id="rs",
+        _omni_is_prefill=False,
+        seed=[1234],
+        temperature=[0.9],
+        top_k=[50],
+    )
+    assert m._generator_by_req["rs"] is gen_first
+
+
+def test_preprocess_without_seed_keeps_default_rng_path():
+    m = _make_backbone()
+    m.config = SimpleNamespace(vocab_size=2051)
+    m._compose_frame_embed = lambda fc: torch.zeros(1, _HIDDEN)
+    m.preprocess(
+        input_ids=torch.tensor([7], dtype=torch.long),
+        input_embeds=None,
+        request_id="ru",
+        _omni_is_prefill=False,
+        temperature=[0.9],
+        top_k=[50],
+    )
+    assert "ru" not in m._generator_by_req  # forward() then passes generator=None
+
+
+def test_preprocess_different_requests_get_independent_generators():
+    m = _make_backbone()
+    m.config = SimpleNamespace(vocab_size=2051)
+    m._compose_frame_embed = lambda fc: torch.zeros(1, _HIDDEN)
+    for req, seed in (("a", 1), ("b", 2)):
+        m.preprocess(
+            input_ids=torch.tensor([7], dtype=torch.long),
+            input_embeds=None,
+            request_id=req,
+            _omni_is_prefill=False,
+            seed=[seed],
+            temperature=[0.9],
+            top_k=[50],
+        )
+    assert m._generator_by_req["a"] is not m._generator_by_req["b"]
+    # Independent streams: seeded differently, the initial states differ.
+    assert not torch.equal(m._generator_by_req["a"].get_state(), m._generator_by_req["b"].get_state())
+
+
+def test_forward_threads_seeded_generator_into_cb0_and_depth(monkeypatch):
+    """The per-request generator must govern BOTH sampling sites: the cb0 draw
+    (sample_logits) and the 31 depth-step draws (depth.run)."""
+    import vllm_omni.model_executor.models.csm.csm_backbone as bb
+
+    m = _make_backbone()
+    gen = torch.Generator().manual_seed(77)
+    m._sampling_by_req = {"r0": (0.9, 50)}
+    m._generator_by_req = {"r0": gen}
+    m._max_frames_by_req = {"r0": 100}
+    m._frames_emitted_by_req = {"r0": 0}
+    m.backbone.forward = lambda **kw: torch.randn(1, _HIDDEN)
+    m._compose_frame_embed = lambda fc: torch.zeros(1, _HIDDEN)
+
+    cb0_generators = []
+    monkeypatch.setattr(
+        bb,
+        "sample_logits",
+        lambda logits, temperature, top_k, generator=None: (
+            cb0_generators.append(generator),
+            torch.zeros(1, dtype=torch.long),
+        )[1],
+    )
+    depth_kwargs = {}
+    m.depth = SimpleNamespace(
+        run=lambda **kw: (depth_kwargs.update(kw), torch.ones(1, 32, dtype=torch.long))[1]
+    )
+    monkeypatch.setattr(
+        "vllm.forward_context.get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=None),
+    )
+    m.forward(
+        input_ids=torch.tensor([5], dtype=torch.long),
+        positions=torch.tensor([0]),
+        inputs_embeds=torch.zeros(1, _HIDDEN),
+        runtime_additional_information=[{"request_id": "r0"}],
+    )
+    assert cb0_generators == [gen]
+    assert depth_kwargs["generator"] is gen

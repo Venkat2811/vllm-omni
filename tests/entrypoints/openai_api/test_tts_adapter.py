@@ -157,5 +157,24 @@ async def test_csm_build_carries_sampling_and_frame_cap():
     assert info["max_new_frames"] == [64]
 
 
+@pytest.mark.asyncio
+async def test_csm_build_forwards_request_seed_list_wrapped():
+    """``request.seed`` (the API's documented determinism knob) must reach the
+    in-model sampler via ``additional_information`` -- CSM samples in-model,
+    so the engine-side ``SamplingParams.seed`` alone cannot honor it. Wrapped
+    in a list per the ``_pick`` batch-of-1 convention like every other knob."""
+    from vllm_omni.entrypoints.openai.tts_adapters.csm import CsmTTSAdapter
+
+    adapter = CsmTTSAdapter.__new__(CsmTTSAdapter)
+    adapter._tokenizer = lambda text, add_special_tokens=False: {"input_ids": [1, 2, 3]}
+
+    prepared = await adapter.build(_speech_request(seed=1234), [], False)
+    assert prepared.prompt["additional_information"]["seed"] == [1234]
+
+    # No seed on the request -> no key, so the backbone keeps the default RNG.
+    prepared = await adapter.build(_speech_request(), [], False)
+    assert "seed" not in prepared.prompt["additional_information"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -64,6 +64,23 @@ def test_sample_logits_topk_ge_vocab_is_a_noop_mask():
     assert sample_logits(logits, temperature=1.0, top_k=999).tolist() == [0]
 
 
+def test_sample_logits_generator_gives_reproducible_draws():
+    """A seeded torch.Generator makes stochastic sampling reproducible (the
+    torch RNG contract behind the API's request.seed determinism guarantee):
+    same seed -> identical draws, different seed -> independent draws."""
+    torch.manual_seed(0)  # fix the logits themselves, not the sampling RNG
+    logits = torch.randn(16, 2051)
+    a = sample_logits(logits, temperature=0.9, top_k=50, generator=torch.Generator().manual_seed(1234))
+    b = sample_logits(logits, temperature=0.9, top_k=50, generator=torch.Generator().manual_seed(1234))
+    c = sample_logits(logits, temperature=0.9, top_k=50, generator=torch.Generator().manual_seed(4321))
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+    # Unseeded path (generator=None) still samples fine: default RNG.
+    d = sample_logits(logits, temperature=0.9, top_k=50)
+    assert d.shape == (16,)
+    assert d.dtype == torch.long
+
+
 # --------------------------------------------------------------------------
 # CsmDepthDecoder.run -- 31-step loop wiring
 # --------------------------------------------------------------------------
@@ -177,3 +194,38 @@ def test_run_is_deterministic_under_greedy(_patch_cache):
     a = _make_depth(_FakeDepthModule()).run(cb0=cb0, backbone_last_hidden_state=hs, temperature=0.0, top_k=0)
     b = _make_depth(_FakeDepthModule()).run(cb0=cb0, backbone_last_hidden_state=hs, temperature=0.0, top_k=0)
     assert torch.equal(a, b)
+
+
+class _FlatLogitsDepthModule(_FakeDepthModule):
+    """Emits uniform (all-equal) logits so every sampled code is pure RNG --
+    the strongest probe that the per-request generator governs the draws."""
+
+    def __call__(self, **kwargs):
+        super().__call__(**kwargs)  # record the call for the wiring asserts
+        bsz = int(kwargs["input_ids"].shape[0])
+        return _FakeDepthOut(torch.zeros((bsz, 1, self.vocab)), kwargs["past_key_values"])
+
+
+def test_run_same_seed_reproduces_identical_codes_at_temperature_0_9(_patch_cache):
+    """request.seed determinism contract (protocol/audio.py): the same seed
+    must reproduce the same 32-code frame under stochastic sampling; a
+    different seed draws independently."""
+    cb0 = torch.tensor([7], dtype=torch.long)
+    hs = torch.randn(1, 2048)
+
+    def run_with(seed: int) -> torch.Tensor:
+        return _make_depth(_FlatLogitsDepthModule()).run(
+            cb0=cb0,
+            backbone_last_hidden_state=hs,
+            temperature=0.9,
+            top_k=50,
+            generator=torch.Generator().manual_seed(seed),
+        )
+
+    a = run_with(11)
+    b = run_with(11)
+    c = run_with(12)
+    assert torch.equal(a, b)
+    # 31 independent uniform draws over the codebook vocab: a full collision
+    # across seeds is impossible in practice (and this is deterministic).
+    assert not torch.equal(a, c)

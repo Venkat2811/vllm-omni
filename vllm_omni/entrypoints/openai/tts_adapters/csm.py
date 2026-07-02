@@ -128,8 +128,11 @@ class CsmTTSAdapter(ARTTSAdapter):
         (validated above) and drive both cb0 and the inline depth decoder, with
         HF-reference defaults. They travel via ``additional_information`` because
         CSM samples inside the model (``sample_logits`` + ``depth.run``), not
-        through the engine ``SamplingParams``. ``max_new_frames`` bounds a
-        rollout that never reaches natural EOS.
+        through the engine ``SamplingParams`` -- and so does ``request.seed``
+        (qwen3_tts precedent: an in-model sampler cannot see the engine-side
+        ``SamplingParams.seed``), which the backbone turns into a per-request
+        ``torch.Generator`` so the API's documented determinism contract holds.
+        ``max_new_frames`` bounds a rollout that never reaches natural EOS.
         """
         tokenizer = self._get_tokenizer()
         speaker = str(request.voice).strip() if request.voice is not None else "0"
@@ -146,6 +149,8 @@ class CsmTTSAdapter(ARTTSAdapter):
             "top_k": [top_k],
             "max_new_frames": [max_frames],
         }
+        if request.seed is not None:
+            additional_information["seed"] = [request.seed]
 
         prompt = tokens_input(prompt_token_ids=prompt_token_ids)
         prompt["additional_information"] = additional_information

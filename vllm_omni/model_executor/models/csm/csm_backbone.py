@@ -286,6 +286,14 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         self._cb0_by_row: list[int | None] = []
         # Per-request sampling params resolved at first preprocess.
         self._sampling_by_req: dict[str, tuple[float, int]] = {}
+        # Per-request seeded RNG (request.seed via additional_information),
+        # threaded through the in-model cb0 + depth-loop sampling so a seeded
+        # request reproduces the same rollout (the API's documented
+        # determinism contract). Absent for unseeded requests (default RNG).
+        # A per-request torch.Generator, NOT torch.manual_seed: concurrent
+        # lanes must not share (or reseed) the global RNG. Freed in
+        # on_requests_finished.
+        self._generator_by_req: dict[str, torch.Generator] = {}
         # GATE-B hard frame cap. _max_frames_by_req[req] is the resolved cap
         # (from the request's SamplingParams.max_tokens, falling back to
         # _DEFAULT_MAX_FRAMES); _frames_emitted_by_req[req] counts non-prefill
@@ -526,6 +534,18 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             temperature = float(_pick(info_dict, "temperature", _DEFAULT_TEMPERATURE))
             top_k = int(_pick(info_dict, "top_k", _DEFAULT_TOP_K))
             self._sampling_by_req[req_key] = (temperature, top_k)
+            # request.seed (forwarded by the serving adapter, qwen3_tts
+            # precedent): seed a dedicated per-request generator for the
+            # in-model cb0 + depth sampling. No seed -> no generator entry ->
+            # default RNG, exactly the pre-seed behavior.
+            seed = _pick(info_dict, "seed", None)
+            if seed is not None:
+                try:
+                    gen = torch.Generator(device=device)
+                    gen.manual_seed(int(seed))
+                    self._generator_by_req[req_key] = gen
+                except (TypeError, ValueError):
+                    logger.warning("CSM req %s: ignoring non-integer seed %r", req_key, seed)
 
         # Resolve + cache the hard frame cap once (GATE-B). Prefer an explicit
         # per-request cap forwarded via additional_information ("max_new_frames"
@@ -695,6 +715,7 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                 continue
             req_key = _req_key(info)
             temperature, top_k = self._sampling_by_req.get(req_key, (_DEFAULT_TEMPERATURE, _DEFAULT_TOP_K))
+            generator = self._generator_by_req.get(req_key)
 
             start = int(qsl[i].item())
             end = int(qsl[i + 1].item())
@@ -705,7 +726,7 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             # cb0 via the LogitsProcessor (NOT a direct ParallelLMHead.forward --
             # the b3c bug). Applies the head matmul + TP gather + vocab trim.
             cb0_logits = self.backbone.logits_processor(self.backbone.cb0_head, last_hidden)
-            cb0 = sample_logits(cb0_logits, temperature, top_k)  # (1,)
+            cb0 = sample_logits(cb0_logits, temperature, top_k, generator=generator)  # (1,)
 
             # 31-step inline depth -> (1, 32) Long.
             frame_codes = self.depth.run(
@@ -713,6 +734,7 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                 backbone_last_hidden_state=last_hidden,
                 temperature=temperature,
                 top_k=top_k,
+                generator=generator,
             )
 
             # Latch the committed cb0 for this row: it drove the depth loop,
@@ -900,5 +922,6 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             self._cached_sigma_by_req.pop(key, None)
             self._eos_by_req.pop(key, None)
             self._sampling_by_req.pop(key, None)
+            self._generator_by_req.pop(key, None)
             self._max_frames_by_req.pop(key, None)
             self._frames_emitted_by_req.pop(key, None)

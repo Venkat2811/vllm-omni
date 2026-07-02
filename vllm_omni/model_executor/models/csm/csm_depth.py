@@ -30,7 +30,12 @@ import torch
 import torch.nn as nn
 
 
-def sample_logits(logits: torch.Tensor, temperature: float, top_k: int) -> torch.Tensor:
+def sample_logits(
+    logits: torch.Tensor,
+    temperature: float,
+    top_k: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     """Sample one token id per row from logits (REUSE: csm.py:89 ``_sample_logits``).
 
     Logits are cast to fp32 + ``nan_to_num`` before any softmax/argmax (the b3
@@ -38,6 +43,11 @@ def sample_logits(logits: torch.Tensor, temperature: float, top_k: int) -> torch
     ``torch.multinomial``'s device-side assert). ``temperature<=0`` is greedy.
     Op shapes are kept fixed (top-k via masked fill) so a future CUDA-graph
     capture sees a stable reduction order. Returns a ``(B,)`` LongTensor.
+
+    ``generator`` (optional) is a per-request seeded ``torch.Generator`` so a
+    request carrying ``seed`` reproduces the same rollout (the API's
+    documented determinism contract); ``None`` keeps the default RNG.
+    Concurrent lanes must NOT share the global RNG via ``torch.manual_seed``.
     """
     logits = logits.float()
     logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -49,7 +59,7 @@ def sample_logits(logits: torch.Tensor, temperature: float, top_k: int) -> torch
         kth = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
         logits = torch.where(logits < kth, torch.full_like(logits, float("-inf")), logits)
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    return torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
 
 
 class CsmDepthDecoder(nn.Module):
@@ -86,6 +96,7 @@ class CsmDepthDecoder(nn.Module):
         backbone_last_hidden_state: torch.Tensor,
         temperature: float,
         top_k: int,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """31-step inner depth-decoder AR loop -> a 32-code frame.
 
@@ -96,7 +107,9 @@ class CsmDepthDecoder(nn.Module):
 
         Args are kept ``(B, *)`` (per-lane B=1 is the correctness anchor) so a
         future across-lane depth-batch can be flipped on by stacking lanes into
-        the batch dim without changing the loop body.
+        the batch dim without changing the loop body. ``generator`` is the
+        per-request seeded RNG threaded through every depth-step sample (see
+        :func:`sample_logits`).
 
         Returns ``(B, 32)`` Long: cb0 from the backbone plus cb1..cb31.
         """
@@ -139,7 +152,7 @@ class CsmDepthDecoder(nn.Module):
                 )
             past = out.past_key_values
             step_logits = out.logits[:, -1, :]  # (B, vocab)
-            next_code = sample_logits(step_logits, temperature, top_k)  # (B,)
+            next_code = sample_logits(step_logits, temperature, top_k, generator=generator)  # (B,)
             codes[:, step + 1] = next_code
             cur_input = next_code.view(bsz, 1)
 
