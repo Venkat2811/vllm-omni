@@ -64,6 +64,11 @@ def _make_backbone() -> CsmBackboneForConditionalGeneration:
     m._max_frames_by_req = {}
     m._frames_emitted_by_req = {}
     m.backbone = SimpleNamespace(logits_processor=_FakeLogitsProcessor(), cb0_head=object())
+    # Codebook-0 embedding table stub (the no-cache decode fallback does a
+    # direct embed_audio_tokens lookup).
+    m._frame_embed = SimpleNamespace(
+        embed_audio_tokens=lambda ids: torch.zeros(int(ids.shape[0]), _HIDDEN)
+    )
     return m
 
 
@@ -338,10 +343,24 @@ def test_preprocess_decode_uses_cached_sigma_alone():
     assert upd == {}
 
 
-def test_preprocess_decode_without_cache_uses_base_embed_only():
+def test_preprocess_decode_without_cache_uses_direct_cb0_lookup_only():
+    """REGRESSION GUARD: the no-cache fallback must embed codebook 0 ALONE.
+    Composing a [cb0, 0, ..., 0] frame through the 32-codebook Sigma adds the
+    learned code-0 embeddings of codebooks 1..31 -- collectively the all-zero
+    EOS-frame pattern -- biasing every step this path fires toward EOS. In HF
+    semantics no mid-rollout input state resembles [cb0, 0*31]."""
     m = _make_backbone()
     m.config = SimpleNamespace(vocab_size=2051)
-    m._compose_frame_embed = lambda fc: torch.full((1, _HIDDEN), 2.0)
+    m._compose_frame_embed = lambda fc: (_ for _ in ()).throw(
+        AssertionError("fallback must not compose a full 32-codebook frame")
+    )
+    captured = {}
+
+    def _embed_audio(ids):
+        captured["ids"] = ids
+        return torch.full((int(ids.shape[0]), _HIDDEN), 2.0)
+
+    m._frame_embed = SimpleNamespace(embed_audio_tokens=_embed_audio)
     m._cached_sigma_by_req = {}
     _, embeds, _ = m.preprocess(
         input_ids=torch.tensor([7], dtype=torch.long),
@@ -350,6 +369,8 @@ def test_preprocess_decode_without_cache_uses_base_embed_only():
         _omni_is_prefill=False,
     )
     torch.testing.assert_close(embeds, torch.full((1, _HIDDEN), 2.0))
+    # Direct codebook-0 lookup of the delivered token (codebook 0 offset is 0).
+    assert captured["ids"].tolist() == [7]
 
 
 def test_preprocess_prefill_returns_text_prompt_span():

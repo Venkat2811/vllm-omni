@@ -645,13 +645,23 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         if cached is not None:
             return input_ids_out, cached.to(device=device, dtype=self._backbone_dtype), {}
 
-        # No cache yet. This should not happen at a real decode step (the prefill
-        # forward caches frame 0's Sigma before the first decode), but keep a safe
-        # fallback: the cb0-only embed of the scheduler-delivered token.
+        # No cache yet. This should not happen at a real decode step (the
+        # prefill forward caches frame 0's Sigma before the first decode); if
+        # it fires for a real request, the Sigma cache key plumbing broke --
+        # log it. Fallback: the codebook-0 embedding of the scheduler-
+        # delivered token ALONE, via a direct embed_audio_tokens lookup
+        # (codebook 0 has offset 0). Composing a [cb0, 0, ..., 0] frame
+        # through the 32-codebook Sigma instead would ADD the learned code-0
+        # embeddings of codebooks 1..31 -- the all-zero EOS-frame pattern --
+        # biasing the rollout toward EOS on every step this path fires.
+        if not is_dummy:
+            logger.warning_once(
+                "CSM req %s: decode step with no cached Sigma; using the cb0-only fallback embed "
+                "(indicates broken per-request cache key plumbing).",
+                req_key,
+            )
         cb0_token = input_ids_out.reshape(-1)[:1].to(torch.long)  # (1,)
-        cb0_frame = torch.zeros((1, self.num_codebooks), dtype=torch.long, device=device)
-        cb0_frame[0, 0] = cb0_token[0]
-        base = self._compose_frame_embed(cb0_frame)  # (1, hidden)
+        base = self._frame_embed.embed_audio_tokens(cb0_token).to(self._backbone_dtype).reshape(1, -1)
         return input_ids_out, base, {}
 
     # NOTE: no ``preprocess_decode_batch`` here, deliberately. The runner
