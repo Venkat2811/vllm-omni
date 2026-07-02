@@ -536,6 +536,42 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             base = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
             return input_ids, base, {}
 
+        is_dummy = bool(info_dict.get("_is_dummy"))
+        is_prefill_raw = info_dict.get("_omni_is_prefill")
+        if isinstance(is_prefill_raw, bool):
+            is_prefill = is_prefill_raw
+        else:
+            try:
+                is_prefill = int(info_dict["_omni_num_computed_tokens"]) < int(info_dict["_omni_prompt_len"])
+            except Exception:
+                is_prefill = span_len > 1
+
+        # Fail loud at admission (prefill) when the request cannot be served
+        # correctly. Without ``request_id`` the per-request Sigma/sampling/cap
+        # state collapses onto a shared key ("0") and concurrent requests
+        # bleed into each other; without ``prompt_token_ids`` the prompt would
+        # embed as BOS + zeros. Both produce garbage audio that returns
+        # SUCCESSFULLY -- so reject instead of degrading. (A request without
+        # additional_information also has no model_intermediate_buffer entry,
+        # so forward() would see {} and key its state by "0" even though this
+        # hook saw the runner-stamped request_id.)
+        if is_prefill and not is_dummy:
+            missing = []
+            if not any(
+                info_dict.get(k) for k in ("request_id", "global_request_id", "_omni_req_id", "req_id")
+            ):
+                missing.append("request_id")
+            if _pick(info_dict, "prompt_token_ids", None) is None:
+                missing.append("prompt_token_ids")
+            if missing:
+                raise ValueError(
+                    f"CSM prefill is missing required per-request keys {missing}: CSM requests "
+                    "must carry additional_information={'prompt_token_ids': [ids], ...} (the "
+                    "serving adapter and the offline example both build it); without it the "
+                    "per-request feedback state and the prompt embedding silently degrade to "
+                    "garbage audio."
+                )
+
         # Resolve + cache per-request sampling once.
         if req_key not in self._sampling_by_req:
             temperature = float(_pick(info_dict, "temperature", _DEFAULT_TEMPERATURE))
@@ -571,15 +607,6 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                 cap_int = _DEFAULT_MAX_FRAMES
             self._max_frames_by_req[req_key] = cap_int
             self._frames_emitted_by_req[req_key] = 0
-
-        is_prefill_raw = info_dict.get("_omni_is_prefill")
-        if isinstance(is_prefill_raw, bool):
-            is_prefill = is_prefill_raw
-        else:
-            try:
-                is_prefill = int(info_dict["_omni_num_computed_tokens"]) < int(info_dict["_omni_prompt_len"])
-            except Exception:
-                is_prefill = span_len > 1
 
         # Keep token ids in-vocab for vLLM bookkeeping (Qwen3 invariant
         # qwen3_tts_talker.py:687-689). cb0 ids are already in [0, vocab); clamp

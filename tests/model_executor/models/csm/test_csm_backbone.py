@@ -361,6 +361,7 @@ def test_preprocess_prefill_returns_text_prompt_span():
         input_ids=torch.tensor([1, 2, 3], dtype=torch.long),
         input_embeds=None,
         request_id="rp",
+        prompt_token_ids=[[1, 2, 3]],
         _omni_is_prefill=True,
         _omni_num_computed_tokens=0,
         _omni_prompt_len=3,
@@ -368,6 +369,55 @@ def test_preprocess_prefill_returns_text_prompt_span():
     assert embeds.shape == (3, _HIDDEN)
     torch.testing.assert_close(embeds, prompt)
     assert upd == {}
+
+
+def test_preprocess_prefill_rejects_missing_prompt_token_ids():
+    """A prefill without prompt_token_ids would embed the prompt as BOS +
+    zeros and return garbage audio with HTTP 200 -- it must be rejected."""
+    m = _make_backbone()
+    m.config = SimpleNamespace(vocab_size=2051)
+    with pytest.raises(ValueError, match="prompt_token_ids"):
+        m.preprocess(
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.long),
+            input_embeds=None,
+            request_id="rp",
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=0,
+            _omni_prompt_len=3,
+        )
+
+
+def test_preprocess_prefill_rejects_missing_request_id():
+    """Without a request id the per-request Sigma/sampling/cap state keys
+    collapse onto the shared fallback and concurrent requests corrupt each
+    other -- fail loudly instead."""
+    m = _make_backbone()
+    m.config = SimpleNamespace(vocab_size=2051)
+    with pytest.raises(ValueError, match="request_id"):
+        m.preprocess(
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.long),
+            input_embeds=None,
+            prompt_token_ids=[[1, 2, 3]],
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=0,
+            _omni_prompt_len=3,
+        )
+
+
+def test_preprocess_dummy_prefill_is_exempt_from_admission_checks():
+    # Profiling/dummy runs carry no request identity or prompt by design.
+    m = _make_backbone()
+    m.config = SimpleNamespace(vocab_size=2051)
+    m._embed_text_prompt = lambda info, device: torch.zeros(3, _HIDDEN)
+    ids, embeds, upd = m.preprocess(
+        input_ids=torch.tensor([1, 2, 3], dtype=torch.long),
+        input_embeds=None,
+        _is_dummy=True,
+        _omni_is_prefill=True,
+        _omni_num_computed_tokens=0,
+        _omni_prompt_len=3,
+    )
+    assert embeds.shape == (3, _HIDDEN)
 
 
 def test_on_requests_finished_frees_all_per_request_state():
