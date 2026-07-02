@@ -572,6 +572,37 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                     "garbage audio."
                 )
 
+        try:
+            num_computed = int(info_dict.get("_omni_num_computed_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            num_computed = 0
+
+        # Fail loud on resume-after-preemption (v1 scheduler RECOMPUTE). A
+        # resumed request re-runs prompt + already-generated tokens with
+        # num_computed_tokens reset to 0, but CSM cannot replay generated
+        # positions: their original inputs were per-frame 32-codebook Sigma
+        # embeds and only the LAST frame's Sigma is retained, so the rebuilt
+        # KV prefix would be silently wrong and all audio after the resume
+        # garbage. Detection is precise because intermediate prefill chunks
+        # create no rollout state (forward's chunked-prefill gate): rollout
+        # state at a num_computed==0 prefill can only mean a preempted
+        # request (one preempted DURING its own prefill has no rollout state
+        # and replays cleanly). Full replay support -- retaining the
+        # per-request frame history and recomposing Sigma embeds for
+        # generated positions -- is a follow-up; until then a clear error
+        # beats silently corrupted audio.
+        if is_prefill and not is_dummy and num_computed == 0:
+            frames_done = self._frames_emitted_by_req.get(req_key, 0)
+            if frames_done > 0 or req_key in self._cached_sigma_by_req:
+                raise RuntimeError(
+                    f"CSM req {req_key}: prefill restarted after {frames_done} generated "
+                    "frame(s) -- this is the scheduler's preemption RECOMPUTE resume, which "
+                    "CSM cannot replay (the per-frame Sigma history is not retained). "
+                    "Aborting instead of returning corrupted audio. Keep stage-0 KV headroom "
+                    "(deploy yaml gpu_memory_utilization / max_num_seqs / max_model_len) "
+                    "above demand so requests are never preempted."
+                )
+
         # Resolve + cache per-request sampling once.
         if req_key not in self._sampling_by_req:
             temperature = float(_pick(info_dict, "temperature", _DEFAULT_TEMPERATURE))
@@ -622,10 +653,34 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             e = max(0, min(offset + span_len, int(prompt_embeds.shape[0])))
             take = prompt_embeds[s:e]
             if int(take.shape[0]) < span_len:
+                # A prefill span extending past the prompt embedding can only
+                # be a preemption-recompute replay of generated positions,
+                # whose inputs (per-frame Sigma embeds) cannot be rebuilt from
+                # token ids. Zero-padding here silently corrupted the KV
+                # prefix; refuse instead (dummy/profile rows keep the pad).
+                if not is_dummy:
+                    raise RuntimeError(
+                        f"CSM req {req_key}: prefill span [{offset}, {offset + span_len}) extends "
+                        f"past the {int(prompt_embeds.shape[0])}-token prompt embedding -- generated "
+                        "positions cannot be re-embedded from token ids (preemption-recompute "
+                        "replay is unsupported for CSM)."
+                    )
                 pad_n = span_len - int(take.shape[0])
                 pad = torch.zeros((pad_n, self.hidden_size), device=device, dtype=self._backbone_dtype)
                 take = torch.cat([take, pad], dim=0)
             return input_ids_out, take, {}
+
+        # A multi-token non-prefill span can only be a preemption-recompute
+        # catch-up over generated positions (a normal decode schedules exactly
+        # one frame token per step); the runner would also only write one row
+        # of the returned embedding back. Refuse rather than silently rebuild
+        # a corrupt span.
+        if span_len != 1 and not is_dummy:
+            raise RuntimeError(
+                f"CSM req {req_key}: got a {span_len}-token non-prefill span; CSM decodes "
+                "exactly one frame per step, so a multi-token span here can only be a "
+                "preemption-recompute catch-up, which CSM cannot replay."
+            )
 
         # Decode: span_len == 1. The backbone input for this position is the FULL
         # 32-codebook Sigma-embedding of the PREVIOUS frame, and nothing else. HF

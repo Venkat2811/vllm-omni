@@ -459,6 +459,89 @@ def test_on_requests_finished_frees_all_per_request_state():
 
 
 # --------------------------------------------------------------------------
+# Preemption (RECOMPUTE resume): detect and fail loud, never corrupt silently
+# --------------------------------------------------------------------------
+
+
+def test_preprocess_detects_resume_after_preemption_and_fails_loud():
+    """A prefill restarting at num_computed==0 for a request that already has
+    rollout state (cached Sigma / emitted frames) is the v1 scheduler's
+    preemption RECOMPUTE resume. CSM cannot replay it (only the last frame's
+    Sigma survives), so it must raise instead of rebuilding a corrupt KV
+    prefix and completing with garbage audio."""
+    m = _make_backbone()
+    m.config = SimpleNamespace(vocab_size=2051)
+    m._embed_text_prompt = lambda info, device: torch.zeros(3, _HIDDEN)
+    m._cached_sigma_by_req = {"rp": torch.zeros(1, _HIDDEN)}
+    m._frames_emitted_by_req = {"rp": 4}
+    with pytest.raises(RuntimeError, match="preemption"):
+        m.preprocess(
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.long),
+            input_embeds=None,
+            request_id="rp",
+            prompt_token_ids=[[1, 2, 3]],
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=0,
+            _omni_prompt_len=3,
+        )
+
+
+def test_preprocess_allows_normal_chunked_prefill_continuation():
+    """Chunk 2+ of an ordinary chunked prefill (num_computed > 0, NO rollout
+    state -- forward's gate creates none for intermediate chunks) must pass."""
+    m = _make_backbone()
+    m.config = SimpleNamespace(vocab_size=2051)
+    prompt = torch.arange(6 * _HIDDEN, dtype=torch.float32).reshape(6, _HIDDEN)
+    m._embed_text_prompt = lambda info, device: prompt
+    ids, embeds, _ = m.preprocess(
+        input_ids=torch.tensor([4, 5, 6], dtype=torch.long),
+        input_embeds=None,
+        request_id="rc",
+        prompt_token_ids=[[1, 2, 3, 4, 5, 6]],
+        _omni_is_prefill=True,
+        _omni_num_computed_tokens=3,
+        _omni_prompt_len=6,
+    )
+    assert embeds.shape == (3, _HIDDEN)
+    torch.testing.assert_close(embeds, prompt[3:6])
+
+
+def test_preprocess_rejects_prefill_span_past_the_prompt():
+    """A prefill span crossing into generated positions (offset+span >
+    prompt embedding length) is a recompute replay; the old behavior
+    zero-padded those rows into the KV prefix -- silent corruption."""
+    m = _make_backbone()
+    m.config = SimpleNamespace(vocab_size=2051)
+    m._embed_text_prompt = lambda info, device: torch.zeros(3, _HIDDEN)
+    with pytest.raises(RuntimeError, match="extends past"):
+        m.preprocess(
+            input_ids=torch.tensor([1, 2, 3, 4, 5], dtype=torch.long),
+            input_embeds=None,
+            request_id="rr",
+            prompt_token_ids=[[1, 2, 3]],
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=1,
+            _omni_prompt_len=3,
+        )
+
+
+def test_preprocess_rejects_multi_token_decode_span():
+    """CSM decodes exactly one frame token per step; a multi-token
+    non-prefill span (recompute catch-up) would silently truncate to one
+    embedding row in the runner."""
+    m = _make_backbone()
+    m.config = SimpleNamespace(vocab_size=2051)
+    m._cached_sigma_by_req = {"rd": torch.zeros(1, _HIDDEN)}
+    with pytest.raises(RuntimeError, match="non-prefill span"):
+        m.preprocess(
+            input_ids=torch.tensor([1, 2], dtype=torch.long),
+            input_embeds=None,
+            request_id="rd",
+            _omni_is_prefill=False,
+        )
+
+
+# --------------------------------------------------------------------------
 # request.seed -> per-request generator (in-model sampling determinism)
 # --------------------------------------------------------------------------
 
