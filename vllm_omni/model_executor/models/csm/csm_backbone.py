@@ -222,7 +222,12 @@ class CsmBackboneForConditionalGeneration(nn.Module):
     use_async_omni_output = True
     eager_omni_postprocess_before_async_output = True
     omni_pooler_payload_include_hidden = False
-    inject_omni_request_id_into_runtime_info = True
+    # NOTE: request identity reaches forward() because the runner stamps
+    # ``request_id`` onto the shared model_intermediate_buffer entry during
+    # its preprocess pass (gpu_model_runner.py:1729) and
+    # _gather_runtime_additional_information later returns that same dict.
+    # There is no model-declared flag gating that delivery; _req_key()
+    # documents the dependency.
 
     packed_modules_mapping = CsmBackbone.packed_modules_mapping
 
@@ -620,30 +625,14 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         base = self._compose_frame_embed(cb0_frame)  # (1, hidden)
         return input_ids_out, base, {}
 
-    def preprocess_decode_batch(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        req_infos: list[dict[str, Any]],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Batched decode-only preprocess (B>1 continuous batching, A3 N8).
-
-        Loops ``preprocess`` over the batch and stacks. CSM does NOT use the
-        runner's talker_mtp fast-path, so we return only ``(ids, embeds, [])``
-        (no mtp_inputs); the runner's plain ``preprocess`` flush path consumes
-        this. Kept here so ``has_talker_mtp`` stays False while still offering a
-        batched entry point symmetric with ``preprocess``.
-        """
-        ids_flat = input_ids.reshape(-1)
-        if int(ids_flat.numel()) != len(req_infos):
-            raise ValueError(f"preprocess_decode_batch expected {len(req_infos)} ids, got {int(ids_flat.numel())}")
-        out_ids: list[torch.Tensor] = []
-        out_embeds: list[torch.Tensor] = []
-        for i, info in enumerate(req_infos):
-            rid, remb, _ = self.preprocess(input_ids=ids_flat[i : i + 1], input_embeds=None, **info)
-            out_ids.append(rid.reshape(-1)[:1])
-            out_embeds.append(remb.reshape(1, -1))
-        return torch.cat(out_ids, dim=0), torch.cat(out_embeds, dim=0), {}
+    # NOTE: no ``preprocess_decode_batch`` here, deliberately. The runner
+    # discovers that hook by name (gpu_model_runner.py:1677) but routes to it
+    # only for talker-MTP models, unpacking a 5-tuple and copying into MTP
+    # buffers that exist only when ``talker_mtp`` is declared
+    # (qwen3_tts_talker.py:783 is the reference implementation). CSM keeps
+    # ``has_talker_mtp`` False, so its B>1 decode is served correctly by the
+    # runner's per-request plain ``preprocess`` loop; defining the hook with
+    # any other contract would be a loaded trap for future routing changes.
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         """No-op postprocess (h_t is consumed inline in forward).
@@ -792,32 +781,6 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                 codes_out[i] = torch.zeros((0, self.num_codebooks), dtype=torch.long, device=device)
             else:
                 codes_out[i] = frame_codes.to(torch.long)  # (1, 32)
-
-            # Default-off validation hook: dump per-request served frames to a
-            # JSONL so an offline driver can assert frame-for-frame vs HF greedy
-            # (GATE-B). Zero effect unless ``VLLM_CSM_DUMP_FRAMES`` is set.
-            _dump = __import__("os").environ.get("VLLM_CSM_DUMP_FRAMES")
-            if _dump:
-                try:
-                    import json as _json
-
-                    _rec = {
-                        "req": req_key,
-                        "eos": bool(is_eos),
-                        "frame": frame_codes[0].detach().cpu().tolist(),
-                    }
-                    # Drift probe (unknown #1): when VLLM_CSM_DUMP_HIDDEN is set,
-                    # also dump the backbone last-hidden-state row used to drive
-                    # cb0 + the inline depth loop, so an offline driver can diff
-                    # it against an HF-eager run on the same prefix (kernel-drift
-                    # signature: small ~1e-3 delta growing with t). Zero cost by
-                    # default; fp32 list for exact compare.
-                    if __import__("os").environ.get("VLLM_CSM_DUMP_HIDDEN"):
-                        _rec["hidden"] = last_hidden[0].detach().float().cpu().tolist()
-                    with open(_dump, "a") as _fh:
-                        _fh.write(_json.dumps(_rec) + "\n")
-                except Exception:
-                    pass
 
         # Publish the per-row EOS + committed-cb0 mappings for compute_logits
         # (called immediately after forward in the same step, same batch-row
