@@ -83,9 +83,13 @@ def test_compute_logits_forces_eos_on_flagged_rows_only():
     assert logits[1, _CODEBOOK_EOS_ID].item() == pytest.approx(1.0e6)
     others = torch.cat([logits[1, :_CODEBOOK_EOS_ID], logits[1, _CODEBOOK_EOS_ID + 1 :]])
     assert torch.isneginf(others).all()
-    # Unflagged rows are untouched (finite ramp, argmax != EOS id).
-    assert torch.isfinite(logits[0]).all() and int(logits[0].argmax()) != _CODEBOOK_EOS_ID
-    assert torch.isfinite(logits[2]).all() and int(logits[2].argmax()) != _CODEBOOK_EOS_ID
+    # Unflagged rows with no latched cb0 keep the raw (finite) ramp except the
+    # stop id, which is masked so the engine can never stop on them.
+    for row in (0, 2):
+        assert torch.isneginf(logits[row, _CODEBOOK_EOS_ID])
+        non_stop = torch.cat([logits[row, :_CODEBOOK_EOS_ID], logits[row, _CODEBOOK_EOS_ID + 1 :]])
+        assert torch.isfinite(non_stop).all()
+        assert int(logits[row].argmax()) != _CODEBOOK_EOS_ID
 
 
 def test_compute_logits_none_hidden_returns_none():
@@ -105,13 +109,17 @@ def test_compute_logits_accepts_omni_output():
 
 
 def test_compute_logits_tolerates_flags_shorter_than_batch():
-    # Stale/short flag list must not crash or touch unflagged rows.
+    # Stale/short flag list must not crash; rows beyond the lists get only
+    # the defensive stop-id mask, never a forced stop.
     m = _make_backbone()
     m._eos_flags_by_row = [True]  # only row 0
     logits = m.compute_logits(torch.randn(3, _HIDDEN))
     assert int(logits[0].argmax()) == _CODEBOOK_EOS_ID
-    assert torch.isfinite(logits[1]).all()
-    assert torch.isfinite(logits[2]).all()
+    for row in (1, 2):
+        assert torch.isneginf(logits[row, _CODEBOOK_EOS_ID])
+        non_stop = torch.cat([logits[row, :_CODEBOOK_EOS_ID], logits[row, _CODEBOOK_EOS_ID + 1 :]])
+        assert torch.isfinite(non_stop).all()
+        assert int(logits[row].argmax()) != _CODEBOOK_EOS_ID
 
 
 # --------------------------------------------------------------------------
@@ -196,7 +204,7 @@ def test_engine_stop_fires_only_on_model_eos_rows(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def _drive_forward(monkeypatch, frame, *, cap, emitted=0):
+def _drive_forward(monkeypatch, frame, *, cap, emitted=0, info=None):
     m = _make_backbone()
     m._sampling_by_req = {"r0": (0.0, 0)}  # greedy -> deterministic cb0
     m._max_frames_by_req = {"r0": cap}
@@ -212,7 +220,7 @@ def _drive_forward(monkeypatch, frame, *, cap, emitted=0):
         input_ids=torch.tensor([5], dtype=torch.long),
         positions=torch.tensor([0]),
         inputs_embeds=torch.zeros(1, _HIDDEN),
-        runtime_additional_information=[{"request_id": "r0"}],
+        runtime_additional_information=[info if info is not None else {"request_id": "r0"}],
     )
     return m, out
 
@@ -262,6 +270,38 @@ def test_forward_returns_omni_output_with_codes_latent(monkeypatch):
     assert isinstance(out, OmniOutput)
     assert "codes" in out.multimodal_outputs
     assert "audio" in out.multimodal_outputs["codes"]
+
+
+def test_forward_skips_frame_emission_for_intermediate_prefill_chunks(monkeypatch):
+    """Chunked prefill: a span that does NOT complete the prompt must emit no
+    frame -- HF runs the depth decoder only on the final prompt position, so
+    a mid-prompt chunk's hidden row is not a frame step. The skipped chunk
+    must leave the GATE-B counter untouched, cache no Sigma, stay un-latched,
+    and be un-stoppable by the engine; the prompt-completing chunk then emits
+    frame 0 normally."""
+    frame = torch.full((1, 32), 5, dtype=torch.long)
+
+    # Intermediate chunk of a 6-token prompt: computed 0, span 1 -> 1 < 6.
+    mid_chunk = {"request_id": "r0", "_omni_num_computed_tokens": 0, "_omni_prompt_len": 6}
+    m, out = _drive_forward(monkeypatch, frame, cap=100, info=mid_chunk)
+    assert out.multimodal_outputs["codes"]["audio"][0] is None  # no frame shipped
+    assert m._frames_emitted_by_req["r0"] == 0  # cap accounting untouched
+    assert "r0" not in m._cached_sigma_by_req  # no Sigma overwrite
+    assert m._eos_flags_by_row == [False]
+    assert m._cb0_by_row == [None]
+    logits = m.compute_logits(out)
+    # Un-latched row: the stop id is masked so the scheduler can never
+    # finish the request on a chunk the model produced no frame for.
+    assert torch.isneginf(logits[0, _CODEBOOK_EOS_ID])
+    assert int(logits[0].argmax()) != _CODEBOOK_EOS_ID
+
+    # Prompt-completing chunk (computed 5 of 6, span 1): frame 0 is emitted.
+    final_chunk = {"request_id": "r0", "_omni_num_computed_tokens": 5, "_omni_prompt_len": 6}
+    m, out = _drive_forward(monkeypatch, frame, cap=100, info=final_chunk)
+    assert out.multimodal_outputs["codes"]["audio"][0].shape == (1, 32)
+    assert m._frames_emitted_by_req["r0"] == 1
+    assert "r0" in m._cached_sigma_by_req
+    assert m._cb0_by_row == [5]
 
 
 # --------------------------------------------------------------------------

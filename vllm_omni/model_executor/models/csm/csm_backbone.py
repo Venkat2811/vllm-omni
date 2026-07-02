@@ -301,8 +301,10 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         self._generator_by_req: dict[str, torch.Generator] = {}
         # GATE-B hard frame cap. _max_frames_by_req[req] is the resolved cap
         # (from the request's SamplingParams.max_tokens, falling back to
-        # _DEFAULT_MAX_FRAMES); _frames_emitted_by_req[req] counts non-prefill
-        # frames surfaced from forward(). When the count reaches the cap,
+        # _DEFAULT_MAX_FRAMES); _frames_emitted_by_req[req] counts frames
+        # surfaced from forward() -- frame 0 from the prompt-completing chunk,
+        # then one per decode step; intermediate chunked-prefill spans emit
+        # nothing and are not counted. When the count reaches the cap,
         # compute_logits forces the frame EOS for that request's row so the AR
         # loop stops at the cap regardless of the natural all-zero EOS firing.
         self._max_frames_by_req: dict[str, int] = {}
@@ -710,6 +712,27 @@ class CsmBackboneForConditionalGeneration(nn.Module):
             end = int(qsl[i + 1].item())
             if end <= start:
                 continue
+
+            # Chunked-prefill guard: only a span that COMPLETES the prompt
+            # (the final prefill chunk -> frame 0) or a decode step may emit a
+            # frame. An intermediate prompt chunk's last hidden row is a
+            # mid-prompt token; sampling a frame from it would ship garbage
+            # codes downstream to Stage 1, skew the GATE-B cap counter, and
+            # overwrite the Sigma cache. HF runs the depth decoder only on the
+            # final prompt position / decode positions. The keys are the same
+            # per-step values preprocess consumes (stamped by the runner,
+            # gpu_model_runner.py:1734-1736); rows lacking them (unit stubs)
+            # default to 0/0, which never skips.
+            try:
+                num_computed = int(info.get("_omni_num_computed_tokens", 0) or 0)
+                prompt_len = int(info.get("_omni_prompt_len", 0) or 0)
+            except (TypeError, ValueError):
+                num_computed, prompt_len = 0, 0
+            if num_computed + (end - start) < prompt_len:
+                # codes_out[i] stays None, the row stays un-latched (masked
+                # stop id in compute_logits), no counter/Sigma update.
+                continue
+
             last_hidden = hidden[end - 1 : end].to(self._backbone_dtype)  # (1, hidden)
 
             # cb0 via the LogitsProcessor (NOT a direct ParallelLMHead.forward --
@@ -856,8 +879,10 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         # order, which desyncs from the current sampler-row order once any
         # request finishes or requests arrive out of order -> the override
         # could land on the wrong request's row. Rows without a latched cb0
-        # (dummy/profile rows, empty spans) keep raw logits; nothing consumes
-        # their sampled token.
+        # (dummy/profile rows, empty spans, skipped intermediate-prefill
+        # chunks) keep raw logits with the stop id masked to -inf: nothing
+        # consumes their sampled token, but the stop check must never fire
+        # on them.
         eos_flags = self._eos_flags_by_row
         cb0_by_row = self._cb0_by_row
         num_rows = int(logits.shape[0])
@@ -876,6 +901,13 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                     committed = _CB0_ZERO_SHADOW_ID
                 logits[row, :] = float("-inf")
                 logits[row, committed] = 1.0e6
+            else:
+                # Rows the model produced no frame decision for this step
+                # (dummy/profile rows, skipped intermediate-prefill chunks):
+                # keep the raw logits for shape stability but mask the stop id
+                # so the scheduler can never finish a request on a row the
+                # model did not latch.
+                logits[row, _CODEBOOK_EOS_ID] = float("-inf")
         return logits
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
