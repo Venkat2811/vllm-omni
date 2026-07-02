@@ -2,14 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU correctness tests for CSM-1B config hoisting + backbone LlamaConfig synthesis.
 
-Covers the two fragile spots:
-  * ``CsmConfig`` hoists the nested ``backbone_config`` fields to the top level
-    (so vLLM reads them) while keeping depth / codec params nested.
+Covers the fragile spots:
+  * ``CsmConfig`` reads the real checkpoint's FLAT top-level backbone fields
+    (falling back to the CSM-1B constants only when absent) and honors an
+    explicitly passed nested ``backbone_config``, while keeping depth / codec
+    params nested. Real config.json values must always beat the constants.
   * ``build_backbone_llama_config`` recovers ``rope_theta`` across the
     transformers >= 5.12 RoPE migration (where ``rope_theta`` is folded INTO
-    ``rope_scaling`` and no longer a top-level attribute) and clamps
-    ``original_max_position_embeddings`` strictly below ``max_position_embeddings``
-    so transformers' rope-parameter validation passes.
+    ``rope_scaling`` and no longer a top-level attribute) and passes the
+    checkpoint's rope-scaling dict through verbatim (transformers' rope
+    validation only warns -- it never raises -- so nothing may be clamped).
 """
 
 import pytest
@@ -61,7 +63,9 @@ def test_backbone_llama_config_is_a_real_llama_config():
     assert llama.num_key_value_heads == 8
     assert llama.head_dim == 64
     assert llama.vocab_size == 2051
-    assert llama.tie_word_embeddings is True
+    # The real checkpoint ships tie_word_embeddings: false, and the native
+    # transformers CsmConfig hard-rejects True -- the default must match.
+    assert llama.tie_word_embeddings is False
 
 
 def test_rope_theta_falls_back_to_csm_default_when_absent():
@@ -85,9 +89,9 @@ def test_rope_theta_recovered_from_nested_rope_scaling():
             "rope_scaling": {
                 "rope_type": "llama3",
                 "factor": 32.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
+                "low_freq_factor": 0.125,
+                "high_freq_factor": 0.5,
+                "original_max_position_embeddings": 1024,
                 "rope_theta": 123456.0,
             }
         }
@@ -97,12 +101,30 @@ def test_rope_theta_recovered_from_nested_rope_scaling():
     assert llama.rope_parameters["rope_theta"] == 123456.0
 
 
-def test_original_max_position_clamped_below_max_position():
-    # rope-parameter validation requires original_max_position_embeddings <
-    # max_position_embeddings (2048). The default 8192 must be clamped to 2047.
+def test_default_rope_scaling_matches_checkpoint_values():
+    # The defaults are byte-identical to sesame/csm-1b config.json (the
+    # "public model facts" contract in the module docstring): the Llama-3.x
+    # curve jointly scaled by 1/8, NOT the Llama-3.2 text-model values.
+    cfg = CsmConfig()
+    assert cfg.rope_scaling["rope_type"] == "llama3"
+    assert cfg.rope_scaling["factor"] == 32.0
+    assert cfg.rope_scaling["low_freq_factor"] == 0.125
+    assert cfg.rope_scaling["high_freq_factor"] == 0.5
+    assert cfg.rope_scaling["original_max_position_embeddings"] == 1024
+
+
+def test_original_max_position_passes_through_unclamped():
+    # The checkpoint's real value (1024) must survive verbatim. An earlier
+    # revision clamped it below max_position_embeddings citing a transformers
+    # validation requirement that does not exist (validation only WARNS on
+    # original >= max_position), silently altering the rope curve. A value
+    # >= max_position_embeddings must also pass through untouched.
     llama = build_backbone_llama_config(CsmConfig())
-    assert llama.rope_scaling["original_max_position_embeddings"] == llama.max_position_embeddings - 1
-    assert llama.rope_scaling["original_max_position_embeddings"] < llama.max_position_embeddings
+    assert llama.rope_scaling["original_max_position_embeddings"] == 1024
+
+    big = CsmConfig(backbone_config={"rope_scaling": {**dict(CsmConfig().rope_scaling), "original_max_position_embeddings": 8192}})
+    llama_big = build_backbone_llama_config(big)
+    assert llama_big.rope_scaling["original_max_position_embeddings"] == 8192
 
 
 def test_explicit_backbone_overrides_are_honored():
@@ -147,7 +169,7 @@ def test_from_pretrained_on_real_transformers_config_layout(tmp_path):
         },
         "vocab_size": 2051,
         "num_codebooks": 32,
-        "tie_word_embeddings": True,
+        "tie_word_embeddings": False,
         "depth_decoder_config": {"hidden_size": 1024, "num_hidden_layers": 4},
         "codec_config": {"sample_rate": 24000, "frame_rate": 12.5},
     }
@@ -159,9 +181,97 @@ def test_from_pretrained_on_real_transformers_config_layout(tmp_path):
     rope = getattr(cfg, "rope_scaling", None) or getattr(cfg, "rope_parameters", None)
     assert rope is not None
     assert float(rope["factor"]) == 32.0
+    assert float(rope["low_freq_factor"]) == 0.125
+    assert float(rope["high_freq_factor"]) == 0.5
+    assert int(rope["original_max_position_embeddings"]) == 1024
+    # The flat top-level backbone fields survive (they coincide with the
+    # CSM-1B constants here; test_from_pretrained_flat_variant_layout below
+    # proves the checkpoint values, not the constants, are what wins).
+    assert cfg.hidden_size == 2048
+    assert cfg.num_hidden_layers == 16
+    assert cfg.num_attention_heads == 32
+    assert cfg.num_key_value_heads == 8
+    assert cfg.head_dim == 64
+    assert cfg.intermediate_size == 8192
+    assert cfg.vocab_size == 2051
+    # tie_word_embeddings: false is the real checkpoint value (the native
+    # transformers CsmConfig hard-rejects True).
+    assert cfg.tie_word_embeddings is False
     # Nested sections still land where the depth loop / Mimi stage read them.
     assert cfg.depth_hidden_size == 1024
     assert cfg.codec_sample_rate == 24000
     # And the recovered config still synthesizes a valid backbone LlamaConfig.
     llama = build_backbone_llama_config(cfg)
     assert llama.max_position_embeddings == 2048
+    assert llama.tie_word_embeddings is False
+
+
+def test_from_pretrained_flat_variant_layout_beats_the_constants(tmp_path):
+    """Regression (review finding): a CSM-family checkpoint whose backbone
+    differs from CSM-1B (e.g. a distilled or vocab-extended variant) uses the
+    real transformers flat layout with NO nested ``backbone_config``. Its
+    values must load verbatim -- pre-fix, every non-rope field was silently
+    clobbered with the hardcoded CSM-1B constants after ``super().__init__``.
+    Every value here is deliberately different from the module constants."""
+    import json
+
+    variant = {
+        "model_type": "csm",
+        "hidden_size": 1024,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 96,
+        "intermediate_size": 4096,
+        "max_position_embeddings": 4096,
+        "vocab_size": 4096,
+        "tie_word_embeddings": False,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(variant))
+
+    cfg = CsmConfig.from_pretrained(tmp_path)
+
+    assert cfg.hidden_size == 1024
+    assert cfg.num_hidden_layers == 8
+    assert cfg.num_attention_heads == 16
+    assert cfg.num_key_value_heads == 4
+    assert cfg.head_dim == 96
+    assert cfg.intermediate_size == 4096
+    assert cfg.max_position_embeddings == 4096
+    assert cfg.vocab_size == 4096
+    # The synthesized backbone LlamaConfig is variant-shaped, not 1B-shaped.
+    llama = build_backbone_llama_config(cfg)
+    assert llama.hidden_size == 1024
+    assert llama.num_hidden_layers == 8
+    assert llama.num_attention_heads == 16
+    assert llama.num_key_value_heads == 4
+    assert llama.head_dim == 96
+    assert llama.intermediate_size == 4096
+    assert llama.vocab_size == 4096
+
+
+def test_save_pretrained_round_trip_preserves_hoisted_fields(tmp_path):
+    """``save_pretrained`` -> ``from_pretrained`` must be lossless for every
+    hoisted backbone field and ``tie_word_embeddings`` (the exported-API
+    contract for this config class)."""
+    fields = {
+        "hidden_size": 1024,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 96,
+        "intermediate_size": 4096,
+        "max_position_embeddings": 4096,
+        "vocab_size": 4096,
+    }
+    cfg = CsmConfig(**fields, tie_word_embeddings=False)
+    cfg.save_pretrained(tmp_path)
+    reloaded = CsmConfig.from_pretrained(tmp_path)
+
+    for name, value in fields.items():
+        assert getattr(reloaded, name) == value, name
+    assert reloaded.tie_word_embeddings is False
+    assert reloaded.rope_scaling["low_freq_factor"] == cfg.rope_scaling["low_freq_factor"]
+    assert reloaded.rope_scaling["original_max_position_embeddings"] == (
+        cfg.rope_scaling["original_max_position_embeddings"]
+    )

@@ -31,16 +31,19 @@ _BACKBONE_HEAD_DIM = 64
 _BACKBONE_INTERMEDIATE_SIZE = 8192
 _BACKBONE_MAX_POSITION_EMBEDDINGS = 2048
 _BACKBONE_ROPE_THETA = 500000.0
-# llama3 RoPE scaling (same family as Llama-3.x): scaled by `factor`.
-# ``original_max_position_embeddings`` is clamped strictly below the backbone
-# context in :func:`build_backbone_llama_config` to satisfy transformers'
-# rope-parameter validation (it must be < max_position_embeddings).
+# llama3 RoPE scaling, byte-identical to the sesame/csm-1b config.json. These
+# are the Llama-3.x family curve parameters jointly scaled by 1/8 (original
+# context 1024, not 8192); the values below are the checkpoint's own, so a
+# default-constructed config matches ``from_pretrained`` on the real layout
+# and is self-consistent with ``max_position_embeddings`` (1024 < 2048, so
+# transformers' rope validation -- which only ever WARNS on
+# original >= max_position, it never raises -- stays silent).
 _BACKBONE_ROPE_SCALING = {
     "rope_type": "llama3",
     "factor": 32.0,
-    "low_freq_factor": 1.0,
-    "high_freq_factor": 4.0,
-    "original_max_position_embeddings": 8192,
+    "low_freq_factor": 0.125,
+    "high_freq_factor": 0.5,
+    "original_max_position_embeddings": 1024,
 }
 
 # --- Public CSM-1B depth-decoder facts (transformers.CsmConfig) ---
@@ -66,10 +69,12 @@ class CsmConfig(PretrainedConfig):
 
     Exposes the backbone parameters at the top level (so vLLM reads them
     directly), keeps the depth-decoder + Mimi codec parameters as nested
-    attributes, and registers under ``model_type = "csm"``. The flat HF
-    ``CsmConfig`` nests ``backbone_config`` / ``depth_decoder_config`` /
-    ``codec_config``; this class hoists the backbone fields and stores the rest
-    for the depth loop (C2) and the Mimi stage (C3).
+    attributes, and registers under ``model_type = "csm"``. The real HF
+    ``CsmConfig`` carries the backbone fields FLAT at the top level and nests
+    only ``depth_decoder_config`` / ``codec_config``; this class reads the
+    flat fields (honoring an explicitly passed nested ``backbone_config``
+    first, for callers that build one programmatically) and stores the nested
+    sections for the depth loop (C2) and the Mimi stage (C3).
     """
 
     model_type = "csm"
@@ -85,16 +90,28 @@ class CsmConfig(PretrainedConfig):
         if hasattr(codec_cfg, "to_dict"):
             codec_cfg = codec_cfg.to_dict()
 
-        # Position/rope fields must exist BEFORE ``super().__init__``:
-        # transformers >= 5.12 standardizes rope parameters inside
-        # ``PretrainedConfig.__init__`` and reads ``max_position_embeddings``
-        # during that pass, so assigning them afterwards breaks
-        # ``from_pretrained`` on a real config.json with AttributeError.
-        # Backbone values win over top-level duplicates, which are popped so
-        # the parent does not re-process a conflicting copy.
+        # Real checkpoint configs (and the native transformers ``CsmConfig``)
+        # carry the backbone fields FLAT at the top level. Pop each top-level
+        # value BEFORE ``super().__init__`` and use it as the fallback when a
+        # nested ``backbone_config`` (explicit callers only) lacks the key, so
+        # real config.json values always win over the hardcoded CSM-1B
+        # constants -- the constants are only the no-argument default.
+        # Position/rope fields must additionally exist BEFORE
+        # ``super().__init__``: transformers >= 5.12 standardizes rope
+        # parameters inside ``PretrainedConfig.__init__`` and reads
+        # ``max_position_embeddings`` during that pass, so assigning them
+        # afterwards breaks ``from_pretrained`` on a real config.json with
+        # AttributeError.
         kwargs_mpe = kwargs.pop("max_position_embeddings", _BACKBONE_MAX_POSITION_EMBEDDINGS)
         kwargs_rope_theta = kwargs.pop("rope_theta", _BACKBONE_ROPE_THETA)
         kwargs_rope_scaling = kwargs.pop("rope_scaling", dict(_BACKBONE_ROPE_SCALING))
+        kwargs_hidden_size = kwargs.pop("hidden_size", _BACKBONE_HIDDEN_SIZE)
+        kwargs_num_layers = kwargs.pop("num_hidden_layers", _BACKBONE_NUM_LAYERS)
+        kwargs_num_heads = kwargs.pop("num_attention_heads", _BACKBONE_NUM_ATTENTION_HEADS)
+        kwargs_num_kv_heads = kwargs.pop("num_key_value_heads", _BACKBONE_NUM_KV_HEADS)
+        kwargs_head_dim = kwargs.pop("head_dim", _BACKBONE_HEAD_DIM)
+        kwargs_intermediate = kwargs.pop("intermediate_size", _BACKBONE_INTERMEDIATE_SIZE)
+        kwargs_vocab_size = kwargs.pop("vocab_size", None)
         self.max_position_embeddings = backbone_cfg.get("max_position_embeddings", kwargs_mpe)
         self.rope_theta = backbone_cfg.get("rope_theta", kwargs_rope_theta)
         self.rope_scaling = backbone_cfg.get("rope_scaling", kwargs_rope_scaling)
@@ -102,20 +119,29 @@ class CsmConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
         # --- Backbone parameters (hoisted to top level for vLLM) ---
-        self.hidden_size = backbone_cfg.get("hidden_size", _BACKBONE_HIDDEN_SIZE)
-        self.num_hidden_layers = backbone_cfg.get("num_hidden_layers", _BACKBONE_NUM_LAYERS)
-        self.num_attention_heads = backbone_cfg.get("num_attention_heads", _BACKBONE_NUM_ATTENTION_HEADS)
-        self.num_key_value_heads = backbone_cfg.get("num_key_value_heads", _BACKBONE_NUM_KV_HEADS)
-        self.head_dim = backbone_cfg.get("head_dim", _BACKBONE_HEAD_DIM)
-        self.intermediate_size = backbone_cfg.get("intermediate_size", _BACKBONE_INTERMEDIATE_SIZE)
-        # tie_word_embeddings avoids a dead ~525 MB text head (A2 §2.1).
-        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
+        self.hidden_size = backbone_cfg.get("hidden_size", kwargs_hidden_size)
+        self.num_hidden_layers = backbone_cfg.get("num_hidden_layers", kwargs_num_layers)
+        self.num_attention_heads = backbone_cfg.get("num_attention_heads", kwargs_num_heads)
+        self.num_key_value_heads = backbone_cfg.get("num_key_value_heads", kwargs_num_kv_heads)
+        self.head_dim = backbone_cfg.get("head_dim", kwargs_head_dim)
+        self.intermediate_size = backbone_cfg.get("intermediate_size", kwargs_intermediate)
+        # The real checkpoint ships ``tie_word_embeddings: false`` and the
+        # native transformers ``CsmConfig`` hard-rejects True, so a config
+        # saved with True is unloadable by the AutoConfig machinery the
+        # pipeline itself uses. The backbone here wraps ``LlamaModel`` plus a
+        # separate untied ``cb0_head`` (vocab 2051, ~8 MB), so the flag gates
+        # no dead weight either way -- default False to match the checkpoint.
+        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", False)
 
         # --- Codebook / frame-embedding parameters ---
         self.num_codebooks = getattr(self, "num_codebooks", _NUM_CODEBOOKS)
         self.codebook_vocab_size = getattr(self, "codebook_vocab_size", _CODEBOOK_VOCAB_SIZE)
-        # Backbone vocab is the cb0 logits surface (one codebook of audio tokens).
-        self.vocab_size = backbone_cfg.get("vocab_size", self.codebook_vocab_size)
+        # Backbone vocab is the cb0 logits surface (one codebook of audio
+        # tokens). Fallback chain: nested backbone_config -> top-level
+        # config.json value -> per-codebook vocab.
+        if kwargs_vocab_size is None:
+            kwargs_vocab_size = self.codebook_vocab_size
+        self.vocab_size = backbone_cfg.get("vocab_size", kwargs_vocab_size)
         self.reserved_codebook_ids = _RESERVED_CODEBOOK_IDS
 
         # --- Depth decoder (nested; consumed by C2 depth loop) ---
@@ -164,14 +190,14 @@ def build_backbone_llama_config(config: CsmConfig) -> LlamaConfig:
     into ``rope_scaling`` / ``rope_parameters`` and exposes no top-level
     ``rope_theta`` attribute, so we recover it from there.
     """
+    # The rope-scaling dict passes through VERBATIM (including
+    # original_max_position_embeddings). An earlier revision clamped
+    # original_max_position_embeddings below max_position_embeddings citing a
+    # transformers validation requirement, but no such hard requirement
+    # exists -- transformers only logs a warning for original >= max_position
+    # -- and the clamp silently altered the rope frequency curve whenever it
+    # fired. The checkpoint's real value (1024 < 2048) needs no adjustment.
     rope_scaling = dict(config.rope_scaling) if config.rope_scaling else None
-    if rope_scaling and "original_max_position_embeddings" in rope_scaling:
-        # transformers' rope-parameter validation requires
-        # original_max_position_embeddings < max_position_embeddings.
-        rope_scaling["original_max_position_embeddings"] = min(
-            rope_scaling["original_max_position_embeddings"],
-            config.max_position_embeddings - 1,
-        )
 
     # transformers >= 5.12 unified the RoPE config: ``rope_theta`` is nested
     # inside ``rope_scaling`` (key ``"rope_theta"``) and is NOT exposed as a
