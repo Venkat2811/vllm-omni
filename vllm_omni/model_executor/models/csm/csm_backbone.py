@@ -89,6 +89,13 @@ _DEFAULT_TOP_K = 50
 # Public CSM/Mimi frame constants.
 _NUM_CODEBOOKS = 32
 _CODEBOOK_EOS_ID = 0  # codebook_eos_token_id; a frame with cb0..cb30==0 is EOS.
+# Shadow id for the compute_logits one-hot echo when the committed cb0 is 0 on
+# a NON-EOS frame (cb0==0 with nonzero deeper codebooks is a legitimate audio
+# code, not EOS). The scheduler-visible token is never read back by the model
+# at decode (preprocess re-injects the cached Sigma), but it IS the input to
+# the scheduler's stop_token_ids=[0] check, so it must not collide with the
+# stop id. Any fixed in-vocab non-zero id works.
+_CB0_ZERO_SHADOW_ID = 1
 
 # Hard frame-cap fallback (GATE-B follow-up). One scheduler decode step == one
 # 80 ms frame, so the AR loop length is bounded by SamplingParams.max_tokens.
@@ -271,6 +278,12 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         # compute_logits consumes it positionally so EOS lands on the correct
         # request's row even under concurrency / staggered finishes.
         self._eos_flags_by_row: list[bool] = []
+        # Committed cb0 id per batch row for THIS step, same row order as
+        # _eos_flags_by_row. compute_logits echoes it as a one-hot so the
+        # engine sampler can only reproduce the model's own frame decision
+        # (single sampling authority); None marks rows forward() skipped
+        # (dummy/profile rows, empty spans), which keep raw logits.
+        self._cb0_by_row: list[int | None] = []
         # Per-request sampling params resolved at first preprocess.
         self._sampling_by_req: dict[str, tuple[float, int]] = {}
         # GATE-B hard frame cap. _max_frames_by_req[req] is the resolved cap
@@ -673,6 +686,8 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         # i corresponds to sampler logits row i in compute_logits (both derive
         # from input_batch.req_ids order). Default False (incl. dummy rows).
         eos_flags_by_row: list[bool] = [False] * num_reqs
+        # Committed cb0 per row (same order); compute_logits echoes it one-hot.
+        cb0_by_row: list[int | None] = [None] * num_reqs
 
         for i in range(num_reqs):
             info = infos[i] if i < len(infos) else {}
@@ -699,6 +714,13 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                 temperature=temperature,
                 top_k=top_k,
             )
+
+            # Latch the committed cb0 for this row: it drove the depth loop,
+            # the Sigma cache and the frame emitted to Stage 1, so it is the
+            # ONLY sampling decision for this step. compute_logits echoes it
+            # as a one-hot so the engine sampler cannot draw a different token
+            # (and in particular cannot draw stop id 0 on a non-EOS frame).
+            cb0_by_row[i] = int(frame_codes[0, 0].item())
 
             # Real frame EOS (A3 §5): cb0..cb30 all-zero. One host-read per frame
             # (outside the depth loop, I3-compliant). Latch so compute_logits stops
@@ -775,9 +797,11 @@ class CsmBackboneForConditionalGeneration(nn.Module):
                 except Exception:
                     pass
 
-        # Publish the per-row EOS mapping for compute_logits (called immediately
-        # after forward in the same step, same batch-row order). Unknown #2 fix.
+        # Publish the per-row EOS + committed-cb0 mappings for compute_logits
+        # (called immediately after forward in the same step, same batch-row
+        # order). Unknown #2 fix.
         self._eos_flags_by_row = eos_flags_by_row
+        self._cb0_by_row = cb0_by_row
 
         # text_hidden_states feeds compute_logits' sample-row gather; pass through.
         return OmniOutput(
@@ -807,15 +831,27 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         hidden_states: torch.Tensor | OmniOutput,
         sampling_metadata: Any = None,
     ) -> torch.Tensor | None:
-        """Emit cb0 logits so the external sampler advances one real in-vocab
-        token per frame, with a real frame-EOS override.
+        """Echo the model-committed cb0 as deterministic one-hot logits.
 
-        The cb0 token id the sampler picks becomes ``input_ids`` for the next
-        step's ``preprocess`` (the scheduler-visible in-vocab token; A3 §3 inv.1).
-        On the real frame EOS (cb0..cb30 all-zero, latched in ``forward``) we force
-        the configured stop id so the scheduler finishes the request. NOT the fake
-        ``(num_rows, 2051)`` EOS grid the single-stage model used (csm.py:847,
-        discarded -- it was a second, conflicting stop authority, A3 §1).
+        ``forward()`` is the SINGLE sampling authority: it samples cb0 in-model
+        (with the request's temperature/top_k), runs the depth loop on it,
+        caches the Sigma feedback and emits the frame to Stage 1. The engine
+        sampler still draws from the logits returned here, so every live row is
+        forced to a one-hot -- the committed cb0 for real frames (a committed
+        id 0 on a non-EOS frame is remapped to ``_CB0_ZERO_SHADOW_ID``) and the
+        stop id 0 for rows latched EOS/cap. Any engine temperature/top_k/seed
+        then reproduces the model's decision exactly, and the scheduler's
+        ``stop_token_ids=[0]`` check fires exactly and only on the model's own
+        stop. Returning the RAW cb0 logits here (pre-fix) let the engine's
+        independent draw land on id 0 during quiet/pause frames and silently
+        truncate the utterance -- the same "second, conflicting stop authority"
+        the discarded single-stage EOS grid had (csm.py:847, A3 §1), recreated
+        through the engine sampler.
+
+        The token id the engine samples becomes ``input_ids`` for the next
+        step's ``preprocess`` (the scheduler-visible in-vocab token; A3 §3
+        inv.1); at decode the model re-injects the cached Sigma and never reads
+        that token back, so the echo changes no model input.
         """
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
@@ -827,20 +863,34 @@ class CsmBackboneForConditionalGeneration(nn.Module):
         if logits is None:
             return None
 
-        # Force EOS (token id 0) on rows whose frame was the real all-zero EOS.
         # The AR runner gathers one sample row per request in batch-row order
         # (hidden_states[logits_indices], same order as input_batch.req_ids);
-        # forward() filled _eos_flags_by_row in that SAME order this step, so we
-        # map positionally (unknown #2 fix). Using dict.values() here was wrong:
-        # dict order is first-seen insertion order, which desyncs from the
-        # current sampler-row order once any request finishes or requests arrive
-        # out of order -> EOS could fire on the wrong request's row.
+        # forward() filled _eos_flags_by_row / _cb0_by_row in that SAME order
+        # this step, so we map positionally (unknown #2 fix). Using
+        # dict.values() here was wrong: dict order is first-seen insertion
+        # order, which desyncs from the current sampler-row order once any
+        # request finishes or requests arrive out of order -> the override
+        # could land on the wrong request's row. Rows without a latched cb0
+        # (dummy/profile rows, empty spans) keep raw logits; nothing consumes
+        # their sampled token.
         eos_flags = self._eos_flags_by_row
+        cb0_by_row = self._cb0_by_row
         num_rows = int(logits.shape[0])
         for row in range(num_rows):
             if row < len(eos_flags) and eos_flags[row]:
+                # Model-latched stop (natural all-zero EOS or GATE-B cap):
+                # force the stop id so the scheduler finishes the request.
                 logits[row, :] = float("-inf")
                 logits[row, _CODEBOOK_EOS_ID] = 1.0e6
+            elif row < len(cb0_by_row) and cb0_by_row[row] is not None:
+                committed = int(cb0_by_row[row])
+                if committed == _CODEBOOK_EOS_ID:
+                    # cb0==0 with nonzero deeper codebooks is REAL audio, not
+                    # EOS; the shadow id keeps stop_token_ids=[0] from firing
+                    # on a frame the model decided to continue.
+                    committed = _CB0_ZERO_SHADOW_ID
+                logits[row, :] = float("-inf")
+                logits[row, committed] = 1.0e6
         return logits
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:

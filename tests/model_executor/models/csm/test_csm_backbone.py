@@ -8,6 +8,10 @@ backbone / depth wrapper:
 
   * ``compute_logits`` EOS row-mapping (the "unknown #2" fix): EOS is forced
     POSITIONALLY on ``_eos_flags_by_row`` rows, never by dict insertion order.
+  * ``compute_logits`` single sampling authority: every live row is a one-hot
+    echo of the cb0 ``forward()`` committed, so the ENGINE sampler (any
+    temperature/top_k/seed) reproduces the model's decision and the scheduler
+    stop (token id 0) can only fire on a model-latched EOS/cap row.
   * ``forward`` EOS / GATE-B frame-cap emit policy: a natural all-zero EOS frame
     is DROPPED (empty latent) while a cap-forced stop KEEPS its real audio frame;
     both latch the row so the scheduler stops.
@@ -22,6 +26,7 @@ import torch
 import torch.nn as nn
 
 from vllm_omni.model_executor.models.csm.csm_backbone import (
+    _CB0_ZERO_SHADOW_ID,
     _CODEBOOK_EOS_ID,
     CsmBackboneForConditionalGeneration,
 )
@@ -51,6 +56,7 @@ def _make_backbone() -> CsmBackboneForConditionalGeneration:
     m._backbone_dtype = torch.float32
     m._dtype = torch.float32
     m._eos_flags_by_row = []
+    m._cb0_by_row = []
     m._eos_by_req = {}
     m._cached_sigma_by_req = {}
     m._sampling_by_req = {}
@@ -105,6 +111,83 @@ def test_compute_logits_tolerates_flags_shorter_than_batch():
     assert int(logits[0].argmax()) == _CODEBOOK_EOS_ID
     assert torch.isfinite(logits[1]).all()
     assert torch.isfinite(logits[2]).all()
+
+
+# --------------------------------------------------------------------------
+# compute_logits: single sampling authority (one-hot echo of committed cb0)
+# --------------------------------------------------------------------------
+
+
+def _engine_sample(logits: torch.Tensor, temperature: float, top_k: int, seed: int) -> int:
+    """Reference engine-side sampler for row 0 (vLLM semantics: temperature
+    scaling, top-k mask, softmax, seeded multinomial; temperature 0 is
+    argmax). Derived from the sampler contract, not from the model code."""
+    row = logits[0:1]
+    if temperature <= 0.0:
+        return int(row.argmax(dim=-1)[0])
+    row = row / temperature
+    if top_k and 0 < top_k < row.shape[-1]:
+        kth = torch.topk(row, top_k, dim=-1).values[..., -1, None]
+        row = torch.where(row < kth, torch.full_like(row, float("-inf")), row)
+    probs = torch.softmax(row, dim=-1)
+    gen = torch.Generator().manual_seed(seed)
+    return int(torch.multinomial(probs, num_samples=1, generator=gen)[0, 0])
+
+
+def test_compute_logits_echoes_committed_cb0_positionally():
+    m = _make_backbone()
+    m._eos_flags_by_row = [False, True, False]
+    m._cb0_by_row = [5, 4, 0]
+    logits = m.compute_logits(torch.randn(3, _HIDDEN))
+    # Row 0: one-hot echo of the committed cb0 (5).
+    assert int(logits[0].argmax()) == 5
+    # Row 1: model-latched EOS wins over the echo -> the stop id.
+    assert int(logits[1].argmax()) == _CODEBOOK_EOS_ID
+    # Row 2: committed cb0==0 on a NON-EOS frame is remapped to the shadow id
+    # so the scheduler stop (token 0) cannot fire on real audio.
+    assert int(logits[2].argmax()) == _CB0_ZERO_SHADOW_ID
+    assert _CB0_ZERO_SHADOW_ID != _CODEBOOK_EOS_ID
+    # Every live row is fully forced: exactly one finite (positive) entry.
+    for row in range(3):
+        assert int(torch.isfinite(logits[row]).sum()) == 1
+
+
+def test_engine_sample_reproduces_committed_cb0_at_any_temperature(monkeypatch):
+    """The engine's sampled token equals the model-committed cb0 under greedy
+    AND under the served stochastic defaults (temperature 0.9 / top_k 50),
+    for any seed: the one-hot leaves the sampler no other choice."""
+    frame = torch.full((1, 32), 5, dtype=torch.long)  # committed cb0 == 5
+    m, out = _drive_forward(monkeypatch, frame, cap=100)
+    assert m._cb0_by_row == [5]
+    logits = m.compute_logits(out)
+    for temperature, top_k, seed in [(0.0, 0, 0), (0.9, 50, 7), (0.9, 50, 8), (2.0, 0, 123)]:
+        assert _engine_sample(logits, temperature, top_k, seed) == 5
+
+
+def test_engine_stop_fires_only_on_model_eos_rows(monkeypatch):
+    # (a) Non-EOS frame whose committed cb0 is 0 (legit audio: deeper
+    # codebooks nonzero): the engine must NEVER draw the stop id.
+    frame = torch.zeros(1, 32, dtype=torch.long)
+    frame[0, 5] = 3  # nonzero cb5 -> not the all-zero EOS frame
+    m, out = _drive_forward(monkeypatch, frame, cap=100)
+    assert m._eos_flags_by_row == [False]
+    logits = m.compute_logits(out)
+    for seed in range(5):
+        assert _engine_sample(logits, 0.9, 50, seed) != _CODEBOOK_EOS_ID
+
+    # (b) Natural all-zero EOS frame: the engine draws the stop id at any
+    # temperature/seed.
+    eos_frame = torch.zeros(1, 32, dtype=torch.long)
+    m, out = _drive_forward(monkeypatch, eos_frame, cap=100)
+    logits = m.compute_logits(out)
+    for temperature, seed in [(0.0, 0), (0.9, 7), (0.9, 8)]:
+        assert _engine_sample(logits, temperature, 50, seed) == _CODEBOOK_EOS_ID
+
+    # (c) Cap-forced stop (real audio frame at the GATE-B cap): stop id too.
+    cap_frame = torch.full((1, 32), 6, dtype=torch.long)
+    m, out = _drive_forward(monkeypatch, cap_frame, cap=1, emitted=0)
+    logits = m.compute_logits(out)
+    assert _engine_sample(logits, 0.9, 50, 3) == _CODEBOOK_EOS_ID
 
 
 # --------------------------------------------------------------------------

@@ -45,8 +45,13 @@ CSM_PIPELINE = PipelineConfig(
             async_chunk_process_next_stage_input_func=f"{_PROC}.backbone2mimi_async_chunk",
             sampling_constraints={
                 "detokenize": False,
-                # Real frame-level EOS is "cb0..cb30 all-zero" forced in
-                # compute_logits (token id 0); this scheduler stop matches it.
+                # Real frame-level EOS is "cb0..cb30 all-zero", decided in the
+                # model. compute_logits echoes forward()'s committed cb0 as a
+                # one-hot per row and surfaces token id 0 ONLY on rows the
+                # model latched EOS/cap (a real cb0==0 audio frame is remapped
+                # to a non-zero shadow id), so this scheduler stop fires
+                # exactly on the model's stop decision regardless of the
+                # engine-side sampling params.
                 "stop_token_ids": [0],
             },
         ),
